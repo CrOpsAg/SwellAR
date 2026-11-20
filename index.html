@@ -83,6 +83,7 @@
   <label>I'm facing true bearing <input id="known" type="number" placeholder="°"></label>
   <div class="row"><button id="calib">Calibrate to that bearing</button></div>
   <label>Horizontal FOV (°) <input id="fov" type="range" min="40" max="100" value="65"><span id="fovv">65</span></label>
+  <label>Pulse color <input id="color" type="color" value="#5ac8f0" style="height:28px;padding:0"></label>
   <label>Camera height (m) <input id="camh" type="number" value="3" step="0.5"></label>
   <label>Pulse spacing × (1 = true scale) <input id="scale" type="range" min="0.1" max="1.5" step="0.05" value="0.3"><span id="scalev">0.3</span></label>
   <div class="row"><button id="closep">Close</button></div>
@@ -256,7 +257,7 @@ const cv = $('cv'), ctx = cv.getContext('2d'), video = $('video');
 const M2FT = 3.28084;
 
 // ---------- settings ----------
-const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, hLocal:4, hBuoy:300, scale:0.3,
+const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, color:'#5ac8f0', hLocal:4, hBuoy:300, scale:0.3,
                    mDir:270, mT:14, mH:1.5, seaward:null };
 let S = Object.assign({}, defaults);
 try { Object.assign(S, JSON.parse(localStorage.getItem('swellar') || '{}')); } catch (e) {}
@@ -270,6 +271,13 @@ bind('buoy','buoy',false); bind('proxy','proxy',false);
 bind('mDir','mDir'); bind('mT','mT'); bind('mH','mH');
 bind('hLocal','hLocal'); bind('hBuoy','hBuoy'); bind('decl','decl'); bind('trim','trim');
 bind('fov','fov',true,()=>$('fovv').textContent=S.fov); bind('camh','camh');
+let colRGB = '90,200,240';
+function applyColor() {                                       // pulse + compass-arrow colour from the picker
+  const h = /^#[0-9a-f]{6}$/i.test(S.color || '') ? S.color : defaults.color;
+  colRGB = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)).join(',');
+  const a = $('arrow') && $('arrow').firstElementChild; if (a) a.setAttribute('fill', h);
+}
+bind('color', 'color', false, applyColor); applyColor();
 bind('scale','scale',true,()=>$('scalev').textContent=S.scale);
 $('fovv').textContent = S.fov; $('scalev').textContent = S.scale;
 $('manualBox').classList.toggle('hide', S.src !== 'manual');
@@ -479,23 +487,38 @@ function frame(now) {
   const k = S.scale, Ls = ns.wp.L * k, vs = ns.wp.c * k, vg = ns.wp.cg * k, Lg = Ls * 7;
   const amp = Math.min(1, 0.45 + swell.Hs / 3);
   const phase = ((vs * t) % Ls + Ls) % Ls;
-  ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'butt';
+  ctx.globalCompositeOperation = 'source-over'; ctx.lineCap = 'butt';   // normal blending so dark colours stay visible
   for (let s = phase - Math.ceil(Smax / Ls) * Ls; s <= Smax; s += Ls) {
     const env = 0.5 + 0.5 * Math.cos(2 * Math.PI * (s - vg * t) / Lg);       // wave groups ("trains") travel at group speed
     const a = amp * (0.12 + 0.88 * Math.pow(env, 1.6));
     if (a < 0.03) continue;
-    let prev = null;
-    for (let u = -Smax; u <= Smax;) {
-      const r = Math.hypot(s, u), fade = 1 - Math.pow(r / Smax, 1.2);
-      const P = [s*p[0] + u*q[0], s*p[1] + u*q[1], -camH];
-      const pr = fade > 0 ? C.project(P, ps, W, H, fpx) : null;
-      if (pr && prev) {
-        const w = Math.max(2, Math.min(12, fpx * 0.5 / pr[2]));
-        ctx.strokeStyle = `rgba(90,200,240,${(0.8 * a * fade).toFixed(3)})`; ctx.lineWidth = w;
-        ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(pr[0], pr[1]); ctx.stroke();
+    // Each crest is drawn as one filled ribbon (no per-segment overlaps, so any colour blends cleanly).
+    const cf = Math.max(0.12, 1 - Math.pow(Math.abs(s) / Smax, 1.2));          // fade by the crest's distance from you
+    ctx.fillStyle = `rgba(${colRGB},${(0.85 * a * cf).toFixed(3)})`;
+    let run = [];
+    const flush = () => {
+      if (run.length > 1) {
+        const L = [], R = [];
+        for (let j = 0; j < run.length; j++) {
+          const p0 = run[Math.max(0, j - 1)], p1 = run[Math.min(run.length - 1, j + 1)];
+          let tx = p1.x - p0.x, ty = p1.y - p0.y; const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+          L.push([run[j].x - ty * run[j].w / 2, run[j].y + tx * run[j].w / 2]);
+          R.push([run[j].x + ty * run[j].w / 2, run[j].y - tx * run[j].w / 2]);
+        }
+        ctx.beginPath(); ctx.moveTo(L[0][0], L[0][1]);
+        for (let j = 1; j < L.length; j++) ctx.lineTo(L[j][0], L[j][1]);
+        for (let j = R.length - 1; j >= 0; j--) ctx.lineTo(R[j][0], R[j][1]);
+        ctx.closePath(); ctx.fill();
       }
-      prev = pr; u += Math.max(3, Math.min(40, 0.12 * r));
+      run = [];
+    };
+    for (let u = -Smax; u <= Smax;) {
+      const r = Math.hypot(s, u);
+      const pr = r < Smax ? C.project([s*p[0] + u*q[0], s*p[1] + u*q[1], -camH], ps, W, H, fpx) : null;
+      if (pr) run.push({ x: pr[0], y: pr[1], w: Math.max(2, Math.min(12, fpx * 0.5 / pr[2])) }); else flush();
+      u += Math.max(3, Math.min(40, 0.12 * r));
     }
+    flush();
   }
 }
 requestAnimationFrame(frame);
