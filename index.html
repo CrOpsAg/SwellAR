@@ -61,8 +61,7 @@
 
 <div id="panel">
   <h3>Wave data</h3>
-  <label>Source <select id="src"><option value="auto">Auto: CDIP nearby, else NDBC, else model</option><option value="cdip">CDIP station</option><option value="model">Model (Open-Meteo)</option><option value="manual">Manual</option></select></label>
-  <label>CDIP station # <input id="cdip" placeholder="169"></label>
+  <label>Source <select id="src"><option value="auto">Auto (nearshore model, else buoy, else model)</option><option value="model">Model (Open-Meteo)</option><option value="manual">Manual</option></select></label>
   <label>Buoy ID (optional) <input id="buoy" placeholder="e.g. 46025"></label>
   <label>CORS proxy URL <input id="proxy" placeholder="https://…/?u="></label>
   <div id="manualBox" class="hide">
@@ -216,6 +215,25 @@ const SwellCore = (() => {
     return null;
   }
 
+  // OPeNDAP .ascii response -> flat number array for variable `name` (handles "[i][j], v" grid rows and comma lists).
+  function parseDapArray(txt, name) {
+    const i = txt.indexOf('\n' + name + '['); if (i < 0) return [];
+    const rows = txt.slice(i + 1).split('\n'), out = [];
+    for (let k = 1; k < rows.length && rows[k].trim() !== ''; k++) {
+      if (rows[k][0] === '[') out.push(+rows[k].slice(rows[k].lastIndexOf(',') + 1));
+      else for (const v of rows[k].split(',')) out.push(+v);
+    }
+    return out;
+  }
+  function nearestIndex(lats, lons, lat, lon) {                 // equirectangular distance, fine at these scales
+    const kx = Math.cos(lat * D2R) * 111.32; let best = -1, bd = Infinity;
+    for (let i = 0; i < lats.length; i++) {
+      const d = Math.hypot((lons[i] - lon) * kx, (lats[i] - lat) * 110.57);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return { i: best, km: bd };
+  }
+
   const haversineKm = (a, b, c, d) => {
     const p = x => x*D2R, dl = p(d-b), dp = p(c-a);
     const h = Math.sin(dp/2)**2 + Math.cos(p(a))*Math.cos(p(c))*Math.sin(dl/2)**2;
@@ -224,7 +242,7 @@ const SwellCore = (() => {
 
   return { D2R, R2D, mod360, angdiff, dot, cross, norm, rotFromEuler, rotYaw, poseFromEuler, poseFromHeadingPitch,
            headingOf, pitchOf, project, waveProps, refract, compassName, parseSpec, parseDataSpec, parseSwdir,
-           peakFromSpectra, parseNcssCsv, haversineKm };
+           peakFromSpectra, parseNcssCsv, parseDapArray, nearestIndex, haversineKm };
 })();
 if (typeof module !== 'undefined') module.exports = SwellCore;
 </script>
@@ -238,7 +256,7 @@ const cv = $('cv'), ctx = cv.getContext('2d'), video = $('video');
 const M2FT = 3.28084;
 
 // ---------- settings ----------
-const defaults = { src:'auto', cdip:'169', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, hLocal:4, hBuoy:300, scale:0.3,
+const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, hLocal:4, hBuoy:300, scale:0.3,
                    mDir:270, mT:14, mH:1.5, seaward:null };
 let S = Object.assign({}, defaults);
 try { Object.assign(S, JSON.parse(localStorage.getItem('swellar') || '{}')); } catch (e) {}
@@ -248,7 +266,7 @@ const bind = (id, key, isNum = true, after) => {
   el.addEventListener('input', () => { S[key] = isNum ? (el.value === '' ? null : +el.value) : el.value; save(); after && after(); });
 };
 bind('src','src',false,()=>{ $('manualBox').classList.toggle('hide', S.src!=='manual'); loadSwell(); });
-bind('buoy','buoy',false); bind('cdip','cdip',false); bind('proxy','proxy',false);
+bind('buoy','buoy',false); bind('proxy','proxy',false);
 bind('mDir','mDir'); bind('mT','mT'); bind('mH','mH');
 bind('hLocal','hLocal'); bind('hBuoy','hBuoy'); bind('decl','decl'); bind('trim','trim');
 bind('fov','fov',true,()=>$('fovv').textContent=S.fov); bind('camh','camh');
@@ -298,19 +316,45 @@ async function buoyReading(st) {
   if (from == null || T == null || Hs == null) throw new Error('incomplete');
   return { from, T, Hs, src: 'NDBC ' + st.id, how, distKm: st.km, ageMin };
 }
-// CDIP stations with known depth (verified from CDIP's station page). Others work too, using the "buoy depth" setting.
-const CDIP_KNOWN = { '169': { lat: 34.250917, lon: -119.307783, depth: 18.29, name: 'Ventura Nearshore' } };
-async function cdipReading(id, km) {
-  id = String(id).padStart(3, '0');
-  const iso = ms => new Date(ms).toISOString().slice(0, 19) + 'Z';
-  const url = `https://thredds.cdip.ucsd.edu/thredds/ncss/point/cdip/realtime/${id}p1_rt.nc?var=waveHs&var=waveTp&var=waveDp` +
-              `&time_start=${iso(Date.now() - 3*3600e3)}&time_end=${iso(Date.now() + 3600e3)}&accept=csv`;
-  const r = C.parseNcssCsv(await fetchText(url));
-  if (!r) throw new Error('no recent CDIP data');
-  const ageMin = (Date.now() - r.time) / 60000;
-  if (ageMin > 240) throw new Error('stale');
-  const k = CDIP_KNOWN[id];
-  return { from: r.Dp, T: r.Tp, Hs: r.Hs, src: 'CDIP ' + id + (k ? ' ' + k.name : ''), how: 'peak direction', distKm: km, ageMin, depth: k ? k.depth : undefined };
+// CDIP MOP: CDIP's buoy-driven nearshore wave model. One point every ~100 m along the coast in ~10 m of water, hourly
+// nowcast, and the shore-normal direction for each point. THREDDS allows browser requests, so no proxy is needed.
+const MOP_BASE = 'https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/';
+async function mopTable(set) {                                  // static site list, cached for 30 days
+  const key = 'swellar_mop_' + set;
+  try { const c = JSON.parse(localStorage.getItem(key) || 'null'); if (c && Date.now() - c.t < 30*864e5) return c; } catch (e) {}
+  const r = await fetch(`${MOP_BASE}${set}_alongshore_nowcast.nc.ascii?metaLatitude,metaLongitude,metaShoreNormal,metaWaterDepth`);
+  if (!r.ok) throw new Error('MOP ' + r.status);
+  const x = await r.text();
+  const tb = { t: Date.now(), lat: C.parseDapArray(x, 'metaLatitude'), lon: C.parseDapArray(x, 'metaLongitude'),
+               sn: C.parseDapArray(x, 'metaShoreNormal'), dep: C.parseDapArray(x, 'metaWaterDepth') };
+  if (!tb.lat.length || tb.lat.length !== tb.lon.length) throw new Error('bad MOP table');
+  try { localStorage.setItem(key, JSON.stringify(tb)); } catch (e) {}
+  return tb;
+}
+async function mopReading(lat, lon) {
+  let lastErr = new Error('no nearshore model point within 5 km');
+  for (const set of ['socal', 'norcal']) {
+    try {
+      const tb = await mopTable(set), { i, km } = C.nearestIndex(tb.lat, tb.lon, lat, lon);
+      if (i < 0 || km > 5) continue;
+      const sel = `[0:11][${i}:${i}]`;
+      const r = await fetch(`${MOP_BASE}${set}_alongshore_nowcast.nc.ascii?waveTime,waveFlagPrimary${sel},waveHs${sel},waveTp${sel},waveDp${sel}`);
+      if (!r.ok) throw new Error('MOP data ' + r.status);
+      const x = await r.text();
+      const tm = C.parseDapArray(x, 'waveTime'), fl = C.parseDapArray(x, 'waveFlagPrimary'), Hs = C.parseDapArray(x, 'waveHs'),
+            Tp = C.parseDapArray(x, 'waveTp'), Dp = C.parseDapArray(x, 'waveDp');
+      for (let k = tm.length - 1; k >= 0; k--) {                  // newest good hour
+        if (fl[k] === 1 && Hs[k] >= 0 && Tp[k] > 0 && Dp[k] >= 0 && Dp[k] <= 360) {
+          const ageMin = (Date.now() - tm[k] * 1000) / 60000;
+          if (ageMin > 360) throw new Error('model data stale');
+          return { from: Dp[k], T: Tp[k], Hs: Hs[k], src: 'CDIP nearshore model', how: 'buoy-driven, ' + Math.round(tb.dep[i]) + ' m depth',
+                   distKm: km, ageMin, depth: tb.dep[i], seaward: tb.sn[i] };
+        }
+      }
+      throw new Error('no valid recent model data');
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
 }
 async function modelReading() {
   if (!here) throw new Error('no position');
@@ -326,20 +370,13 @@ async function loadSwell() {
   try {
     if (S.src === 'manual') { swell = { from: S.mDir, T: S.mT, Hs: S.mH, src: 'manual', how: 'manual', distKm: 0, ageMin: 0 }; return; }
     if (!here) { setStatus('Waiting for GPS…'); return; }
-    if (S.src === 'cdip') {
-      try { const k = CDIP_KNOWN[S.cdip]; swell = await cdipReading(S.cdip, k ? C.haversineKm(here.lat, here.lon, k.lat, k.lon) : 0); setStatus(''); return; }
-      catch (e) { setStatus('CDIP unavailable (' + e.message + '). If this is a CORS error, set a proxy in Settings.'); return; }
-    }
     if (S.src === 'auto') {
-      for (const [id, k] of Object.entries(CDIP_KNOWN)) {           // a nearshore CDIP buoy within 30 km beats an offshore NDBC one
-        const km = C.haversineKm(here.lat, here.lon, k.lat, k.lon);
-        if (km < 30) { try { swell = await cdipReading(id, km); setStatus(''); return; } catch (e) {} }
-      }
+      try { swell = await mopReading(here.lat, here.lon); setStatus(''); return; } catch (e) { setStatus('Nearshore model unavailable (' + e.message + ')'); }
       try {
         const list = S.buoy ? [{ id: S.buoy, km: NaN }] : await nearestStations(here.lat, here.lon);
         for (const st of list) { try { swell = await buoyReading(st); setStatus(''); return; } catch (e) {} }
         throw new Error('no buoy with fresh wave data');
-      } catch (e) { setStatus('Buoy unavailable (' + e.message + ') – using model. If this is a CORS error, set a proxy in Settings.'); }
+      } catch (e) { setStatus('Offshore buoy unavailable (' + e.message + '); using the global wave model. A CORS proxy in Settings enables NDBC buoys.'); }
     }
     try { swell = await modelReading(); } catch (e) { setStatus('No wave data: ' + e.message); }
   } finally { loading = false; }
@@ -407,8 +444,9 @@ addEventListener('resize', resize); resize();
 function nearshore() {
   if (!swell) return null;
   const T = Math.max(swell.T, 3);
-  const from = C.refract(swell.from, S.seaward, T, S.hLocal, swell.depth ?? S.hBuoy);
-  return { from, T, wp: C.waveProps(T, S.hLocal) };
+  const sea = S.seaward ?? swell.seaward ?? null;                 // your own "set sea direction" wins over the model's shore normal
+  const from = C.refract(swell.from, sea, T, S.hLocal, swell.depth ?? S.hBuoy);
+  return { from, T, sea, wp: C.waveProps(T, S.hLocal) };
 }
 function backdrop(W, H, pitch) {
   const hy = H/2 + (W/2)/Math.tan(S.fov*C.D2R/2) * Math.tan(pitch*C.D2R);   // looking down (pitch<0) moves the horizon up
@@ -426,7 +464,7 @@ function frame(now) {
   const ft = x => (x * M2FT).toFixed(1);
   if (swell && ns) {
     $('line1').innerHTML = `<b>${ft(swell.Hs)} ft @ ${swell.T.toFixed(0)} s</b> from <b>${Math.round(swell.from)}° ${C.compassName(swell.from)}</b>` +
-      (S.seaward != null ? ` → <b>${Math.round(ns.from)}°</b> at the beach` : '');
+      (ns.sea != null ? ` → <b>${Math.round(ns.from)}°</b> at the beach` : '');
     $('line2').textContent = `${swell.src}` + (swell.distKm ? ` · ${Math.round(swell.distKm)} km` : '') + (swell.ageMin ? ` · ${Math.round(swell.ageMin)} min old` : '') + ` · ${swell.how}` +
       (heading != null ? ` · facing ${Math.round(heading)}°` : '');
   } else $('line1').innerHTML = '<b>SwellAR</b>';
@@ -461,7 +499,8 @@ function frame(now) {
   }
 }
 requestAnimationFrame(frame);
-window.__swellar = { setDemo(o) { demoMode = true; $('start').classList.add('hide'); if (o.heading != null) demoHeading = o.heading;
+window.__swellar = { async probe(lat, lon) { here = { lat, lon }; await loadSwell(); return { swell, status: $('status').textContent }; },
+  setDemo(o) { demoMode = true; $('start').classList.add('hide'); if (o.heading != null) demoHeading = o.heading;
   if (o.swell) swell = Object.assign({ src: 'test', how: 'test', distKm: 0, ageMin: 0 }, o.swell); if (o.seaward !== undefined) S.seaward = o.seaward; } };
 })();
 </script>

@@ -73,4 +73,13 @@ const csv = `time,latitude[unit="degrees_north"],longitude[unit="degrees_east"],
 2026-11-20T20:00:00Z,34.25,-119.31,-999.99,-999.99,-999.99`;
 const cr = C.parseNcssCsv(csv); close(cr.Hs, 1.1, 0, 'cdip Hs'); close(cr.Tp, 14.3, 0, 'cdip Tp'); close(cr.Dp, 271.5, 0, 'cdip Dp');
 assert(C.parseNcssCsv('time,foo\n1,2') === null, 'missing cols -> null'); assert(C.parseNcssCsv('') === null, 'empty -> null');
+// 8. OPeNDAP ascii parsing, using a real response captured from CDIP's MOP aggregate
+const dap = `Dataset {\n    Int32 waveTime[waveTime = 12];\n} x;\n---------------------------------------------\nwaveTime[12]\n1795161600, 1795165200, 1795201200\n\nwaveFlagPrimary[12][1]\n[0], 1\n[1], 1\n[2], 0\n\nwaveHs[12][1]\n[0], 1.0125906\n[1], 0.87462115\n[2], 0.9020019\n\nwaveDp[12][1]\n[0], 229.60316\n[1], 230.39764\n[2], 229.81407\n\n`;
+assert.deepStrictEqual(C.parseDapArray(dap, 'waveTime'), [1795161600, 1795165200, 1795201200]);
+assert.deepStrictEqual(C.parseDapArray(dap, 'waveFlagPrimary'), [1, 1, 0]);
+close(C.parseDapArray(dap, 'waveHs')[2], 0.9020019, 1e-9, 'grid row value'); assert.strictEqual(C.parseDapArray(dap, 'nope').length, 0);
+const tbl = `Dataset {\n    Float32 metaLatitude[siteCount = 3];\n} x;\n---\nmetaLatitude[3]\n34.0, 34.26732, 34.5\n\nmetaLongitude[3]\n-119.0, -119.29997, -119.5\n\n`;
+const la = C.parseDapArray(tbl, 'metaLatitude'), lo = C.parseDapArray(tbl, 'metaLongitude');
+const ni = C.nearestIndex(la, lo, 34.27, -119.30); assert.strictEqual(ni.i, 1); assert(ni.km < 1, 'nearest point < 1 km');
+assert(C.nearestIndex(la, lo, 40, -100).km > 100, 'far away is far');
 console.log('all tests passed');
