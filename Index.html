@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>SwellAR</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#e8f6ff;font:14px/1.35 -apple-system,system-ui,sans-serif;overflow:hidden}
+  video,canvas{position:fixed;inset:0;width:100%;height:100%}
+  video{object-fit:cover;background:#05131c}
+  #hud{position:fixed;left:0;right:0;top:0;padding:env(safe-area-inset-top) 12px 8px;pointer-events:none;
+       background:linear-gradient(#000a,#0000);text-shadow:0 1px 3px #000}
+  #hud b{font-weight:600}
+  #status{opacity:.75;font-size:12px}
+  #compass{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));width:84px;height:84px;pointer-events:none}
+  #btns{position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px}
+  button{font:inherit;color:#fff;background:#0b3a52cc;border:1px solid #6cc7ee88;border-radius:10px;padding:8px 12px}
+  button.primary{background:#0a7aa8;font-size:16px;padding:12px 20px}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+         background:radial-gradient(#0b3a52,#02121a);text-align:center;padding:24px}
+  #start h1{margin:0;font-size:28px;letter-spacing:.5px}
+  #start p{max-width:420px;opacity:.8;margin:0}
+  #panel{position:fixed;right:0;top:0;bottom:0;width:min(340px,92vw);background:#04161fee;padding:12px;overflow:auto;
+         transform:translateX(100%);transition:transform .2s;border-left:1px solid #6cc7ee55;z-index:5}
+  #panel.open{transform:none}
+  #panel h3{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:1px;opacity:.65}
+  #panel label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:5px 0}
+  #panel input,#panel select{width:120px;background:#0a2a3a;color:#fff;border:1px solid #3d7a99;border-radius:6px;padding:4px 6px;font:inherit}
+  #panel input[type=range]{width:140px;padding:0}
+  .row{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+  .hide{display:none!important}
+  small{opacity:.65}
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="cv"></canvas>
+
+<div id="hud"><div id="line1"><b>SwellAR</b></div><div id="line2"></div><div id="status"></div></div>
+
+<svg id="compass" viewBox="-50 -50 100 100">
+  <circle r="46" fill="#0008" stroke="#6cc7ee" stroke-opacity=".6"/>
+  <text y="-34" text-anchor="middle" font-size="9" fill="#fff" opacity=".7">ahead</text>
+  <g id="arrow"><path d="M0,-30 L9,-12 L3,-12 L3,24 L-3,24 L-3,-12 L-9,-12 Z" fill="#7be4ff"/></g>
+</svg>
+
+<div id="btns">
+  <button id="gear">⚙ Settings</button>
+  <button id="shore" title="Face straight out to sea, then tap">⛱ Set sea direction</button>
+</div>
+
+<div id="start">
+  <h1>🌊 SwellAR</h1>
+  <p>Point your phone at the surf. Pulses show which way the swell is travelling, using nearby buoy data, your GPS position and the compass.</p>
+  <button class="primary" id="go">Start camera &amp; sensors</button>
+  <button id="demo">Demo without camera</button>
+  <small>Needs HTTPS. Allow camera, location and motion access.</small>
+</div>
+
+<div id="panel">
+  <h3>Wave data</h3>
+  <label>Source <select id="src"><option value="auto">Buoy (NDBC), model fallback</option><option value="model">Model (Open-Meteo)</option><option value="manual">Manual</option></select></label>
+  <label>Buoy ID (optional) <input id="buoy" placeholder="e.g. 46025"></label>
+  <label>CORS proxy URL <input id="proxy" placeholder="https://…/?u="></label>
+  <div id="manualBox" class="hide">
+    <label>From (° true) <input id="mDir" type="number" value="270"></label>
+    <label>Period (s) <input id="mT" type="number" value="14"></label>
+    <label>Height (m) <input id="mH" type="number" value="1.5" step="0.1"></label>
+  </div>
+  <div class="row"><button id="refresh">Refresh data</button></div>
+
+  <h3>Nearshore refraction</h3>
+  <label>Depth where you look (m) <input id="hLocal" type="number" value="4" step="0.5"></label>
+  <label>Buoy depth (m) <input id="hBuoy" type="number" value="300"></label>
+  <small>Refraction only applies once you've set the sea direction (⛱ button, facing straight out to sea).</small>
+  <div class="row"><button id="clearShore">Clear sea direction</button></div>
+
+  <h3>Compass &amp; camera</h3>
+  <label>Declination (° E +) <input id="decl" type="number" value="0" step="0.5"></label>
+  <label>Heading trim (°) <input id="trim" type="number" value="0" step="1"></label>
+  <label>I'm facing true bearing <input id="known" type="number" placeholder="°"></label>
+  <div class="row"><button id="calib">Calibrate to that bearing</button></div>
+  <label>Horizontal FOV (°) <input id="fov" type="range" min="40" max="100" value="65"><span id="fovv">65</span></label>
+  <label>Camera height (m) <input id="camh" type="number" value="3" step="0.5"></label>
+  <label>Pulse spacing × (1 = true scale) <input id="scale" type="range" min="0.1" max="1.5" step="0.05" value="0.3"><span id="scalev">0.3</span></label>
+  <div class="row"><button id="closep">Close</button></div>
+</div>
+
+<!-- ============ CORE (pure math + parsers; unit-tested in node) ============ -->
+<script id="core">
+const SwellCore = (() => {
+  const D2R = Math.PI / 180, R2D = 180 / Math.PI, G = 9.80665;
+  const mod360 = a => ((a % 360) + 360) % 360;
+  const angdiff = (a, b) => ((a - b + 540) % 360) - 180;           // a-b in [-180,180)
+  const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+  const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+  const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/l, v[1]/l, v[2]/l]; };
+  const mulMV = (M, v) => [dot(M[0], v), dot(M[1], v), dot(M[2], v)];
+  const mulMM = (A, B) => A.map(r => [0,1,2].map(j => r[0]*B[0][j] + r[1]*B[1][j] + r[2]*B[2][j]));
+
+  // World frame: x = East, y = North, z = Up. Device frame (portrait): x right, y up-screen, z out of screen.
+  // W3C DeviceOrientation: R = Rz(alpha) Rx(beta) Ry(gamma).
+  function rotFromEuler(aDeg, bDeg, gDeg) {
+    const a = aDeg*D2R, b = bDeg*D2R, g = gDeg*D2R;
+    const Rz = [[Math.cos(a),-Math.sin(a),0],[Math.sin(a),Math.cos(a),0],[0,0,1]];
+    const Rx = [[1,0,0],[0,Math.cos(b),-Math.sin(b)],[0,Math.sin(b),Math.cos(b)]];
+    const Ry = [[Math.cos(g),0,Math.sin(g)],[0,1,0],[-Math.sin(g),0,Math.cos(g)]];
+    return mulMM(mulMM(Rz, Rx), Ry);
+  }
+  // Rotate about the vertical so that headings increase by deltaDeg (clockwise seen from above).
+  function rotYaw(v, deltaDeg) {
+    const d = deltaDeg*D2R, c = Math.cos(d), s = Math.sin(d);
+    return [v[0]*c + v[1]*s, -v[0]*s + v[1]*c, v[2]];
+  }
+  // Camera = rear camera, looks along -z_device. Image "up" in device coords depends on screen rotation.
+  const UP_DEV = {0:[0,1,0], 90:[1,0,0], 180:[0,-1,0], 270:[-1,0,0]};
+  function poseFromEuler(a, b, g, screenAngle, yawDeg) {
+    const R = rotFromEuler(a, b, g);
+    const f = rotYaw(mulMV(R, [0,0,-1]), yawDeg || 0);
+    const u = rotYaw(mulMV(R, UP_DEV[mod360(Math.round(screenAngle/90)*90)] || UP_DEV[0]), yawDeg || 0);
+    return { f: norm(f), u: norm(u) };
+  }
+  const headingOf = f => mod360(Math.atan2(f[0], f[1]) * R2D);
+  const pitchOf = f => Math.asin(Math.max(-1, Math.min(1, f[2]))) * R2D;
+  function poseFromHeadingPitch(h, p) {
+    h *= D2R; p *= D2R;
+    return { f: [Math.sin(h)*Math.cos(p), Math.cos(h)*Math.cos(p), Math.sin(p)],
+             u: [-Math.sin(h)*Math.sin(p), -Math.cos(h)*Math.sin(p), Math.cos(p)] };
+  }
+  // Pinhole projection of a world-space point (relative to camera) into pixels. null if behind camera.
+  function project(P, pose, W, H, fpx) {
+    const r = cross(pose.f, pose.u);                    // right = f × up
+    const z = dot(P, pose.f);
+    if (z < 0.3) return null;
+    return [W/2 + fpx * dot(P, r) / z, H/2 - fpx * dot(P, pose.u) / z, z];
+  }
+
+  // ---- wave physics ----
+  function waveNumber(T, h) {                           // linear dispersion, ω² = g k tanh(k h)
+    const w = 2*Math.PI/T; let k = w*w/G;
+    for (let i = 0; i < 60; i++) k = w*w / (G * Math.tanh(k*h));
+    return k;
+  }
+  function waveProps(T, h) {
+    const k = waveNumber(T, h), w = 2*Math.PI/T, c = w/k;
+    const n = 0.5 * (1 + 2*k*h / Math.sinh(2*k*h));
+    return { k, c, cg: c*n, L: 2*Math.PI/k };
+  }
+  // Snell refraction over straight, parallel depth contours. All angles are "coming FROM", degrees true.
+  function refract(fromDeg, seawardDeg, T, hLocal, hBuoy) {
+    if (seawardDeg == null) return fromDeg;
+    const a1 = angdiff(fromDeg, seawardDeg);            // angle between wave ray and shore-normal
+    if (Math.abs(a1) >= 89) return fromDeg;             // from land side / alongshore: leave alone
+    const ratio = waveProps(T, hLocal).c / waveProps(T, hBuoy).c;
+    const s2 = Math.max(-1, Math.min(1, ratio * Math.sin(a1*D2R)));
+    return mod360(seawardDeg + Math.asin(s2) * R2D);
+  }
+
+  // ---- parsers for NDBC realtime2 text files ----
+  const COMPASS16 = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  const compassName = d => COMPASS16[Math.round(mod360(d)/22.5) % 16];
+  const compassDeg = s => { const i = COMPASS16.indexOf(String(s).toUpperCase()); return i < 0 ? null : i*22.5; };
+  const num = s => (s === undefined || s === 'MM' || s === '' || isNaN(+s)) ? null : +s;
+  const dataLines = txt => txt.split(/\r?\n/).filter(l => l.trim() && l[0] !== '#');
+  const stamp = t => Date.UTC(+t[0], +t[1]-1, +t[2], +t[3], +t[4]);
+
+  function parseSpec(txt) {                             // newest row (files are newest-first)
+    const l = dataLines(txt)[0]; if (!l) return null;
+    const t = l.trim().split(/\s+/); if (t.length < 15) return null;
+    return { time: stamp(t), WVHT: num(t[5]), SwH: num(t[6]), SwP: num(t[7]), WWH: num(t[8]), WWP: num(t[9]),
+             SwD: compassDeg(t[10]), WWD: compassDeg(t[11]), APD: num(t[13]), MWD: num(t[14]) };
+  }
+  function parsePairs(line) {
+    return [...line.matchAll(/(-?[\d.]+|MM)\s*\((\d*\.?\d+)\)/g)].map(m => ({ v: num(m[1]), f: +m[2] }));
+  }
+  function parseDataSpec(txt) {
+    const l = dataLines(txt)[0]; if (!l) return null;
+    const t = l.trim().split(/\s+/);
+    return { time: stamp(t), sep: num(t[5]), pairs: parsePairs(l) };
+  }
+  function parseSwdir(txt) {
+    const l = dataLines(txt)[0]; if (!l) return null;
+    const t = l.trim().split(/\s+/);
+    return { time: stamp(t), pairs: parsePairs(l) };
+  }
+  // Peak of the energy spectrum (restricted to the swell band if a separation frequency exists) + its direction.
+  function peakFromSpectra(ds, sw) {
+    if (!ds || !sw) return null;
+    let cand = ds.pairs.filter(p => p.v != null && p.v > 0);
+    if (ds.sep != null && ds.sep < 1) { const band = cand.filter(p => p.f <= ds.sep + 1e-6); if (band.length) cand = band; }
+    if (!cand.length) return null;
+    const pk = cand.reduce((a, b) => b.v > a.v ? b : a);
+    const d = sw.pairs.reduce((best, p) => (p.v != null && Math.abs(p.f - pk.f) < Math.abs(best.f - pk.f)) ? p : best, { f: 99, v: null });
+    if (d.v == null || Math.abs(d.f - pk.f) > 0.006) return null;
+    return { T: 1/pk.f, from: mod360(d.v) };
+  }
+
+  const haversineKm = (a, b, c, d) => {
+    const p = x => x*D2R, dl = p(d-b), dp = p(c-a);
+    const h = Math.sin(dp/2)**2 + Math.cos(p(a))*Math.cos(p(c))*Math.sin(dl/2)**2;
+    return 12742 * Math.asin(Math.sqrt(h));
+  };
+
+  return { D2R, R2D, mod360, angdiff, dot, cross, norm, rotFromEuler, rotYaw, poseFromEuler, poseFromHeadingPitch,
+           headingOf, pitchOf, project, waveProps, refract, compassName, parseSpec, parseDataSpec, parseSwdir,
+           peakFromSpectra, haversineKm };
+})();
+if (typeof module !== 'undefined') module.exports = SwellCore;
+</script>
+
+<!-- ============ APP ============ -->
+<script id="app">
+(() => {
+if (typeof document === 'undefined') return;
+const C = SwellCore, $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d'), video = $('video');
+const M2FT = 3.28084;
+
+// ---------- settings ----------
+const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, hLocal:4, hBuoy:300, scale:0.3,
+                   mDir:270, mT:14, mH:1.5, seaward:null };
+let S = Object.assign({}, defaults);
+try { Object.assign(S, JSON.parse(localStorage.getItem('swellar') || '{}')); } catch (e) {}
+const save = () => { try { localStorage.setItem('swellar', JSON.stringify(S)); } catch (e) {} };
+const bind = (id, key, isNum = true, after) => {
+  const el = $(id); el.value = S[key] ?? '';
+  el.addEventListener('input', () => { S[key] = isNum ? (el.value === '' ? null : +el.value) : el.value; save(); after && after(); });
+};
+bind('src','src',false,()=>{ $('manualBox').classList.toggle('hide', S.src!=='manual'); loadSwell(); });
+bind('buoy','buoy',false); bind('proxy','proxy',false);
+bind('mDir','mDir'); bind('mT','mT'); bind('mH','mH');
+bind('hLocal','hLocal'); bind('hBuoy','hBuoy'); bind('decl','decl'); bind('trim','trim');
+bind('fov','fov',true,()=>$('fovv').textContent=S.fov); bind('camh','camh');
+bind('scale','scale',true,()=>$('scalev').textContent=S.scale);
+$('fovv').textContent = S.fov; $('scalev').textContent = S.scale;
+$('manualBox').classList.toggle('hide', S.src !== 'manual');
+
+// ---------- state ----------
+let swell = null;        // {from,T,Hs,src,distKm,ageMin}
+let here = null;         // {lat,lon}
+let pose = null;         // smoothed {f,u} in true-north world frame
+let demoMode = false, demoHeading = 270;
+let absSeen = false, yawIOS = null;
+let rawEuler = null;
+const setStatus = t => $('status').textContent = t;
+
+// ---------- data ----------
+async function fetchText(url) {
+  const u = S.proxy ? S.proxy + encodeURIComponent(url) : url;
+  const r = await fetch(u, { cache: 'no-store' });
+  if (!r.ok) throw new Error(r.status + ' ' + url.split('/').pop());
+  return r.text();
+}
+async function nearestStations(lat, lon, n = 8) {
+  let xml;
+  try { const c = JSON.parse(localStorage.getItem('swellar_st') || 'null'); if (c && Date.now() - c.t < 6*3600e3) xml = c.x; } catch (e) {}
+  if (!xml) { xml = await fetchText('https://www.ndbc.noaa.gov/activestations.xml'); try { localStorage.setItem('swellar_st', JSON.stringify({t:Date.now(), x:xml})); } catch (e) {} }
+  const doc = new DOMParser().parseFromString(xml, 'text/xml');
+  return [...doc.querySelectorAll('station')]
+    .filter(s => /buoy|other|fixed/i.test(s.getAttribute('type') || ''))
+    .map(s => ({ id: s.getAttribute('id'), lat: +s.getAttribute('lat'), lon: +s.getAttribute('lon'), name: s.getAttribute('name') }))
+    .map(s => ({ ...s, km: C.haversineKm(lat, lon, s.lat, s.lon) }))
+    .filter(s => s.km < 500).sort((a, b) => a.km - b.km).slice(0, n);
+}
+async function buoyReading(st) {
+  const base = 'https://www.ndbc.noaa.gov/data/realtime2/' + st.id.toUpperCase();
+  const spec = C.parseSpec(await fetchText(base + '.spec'));
+  if (!spec) throw new Error('no spec');
+  const ageMin = (Date.now() - spec.time) / 60000;
+  if (ageMin > 240) throw new Error('stale');
+  let T = spec.SwP ?? spec.APD, from = spec.SwD ?? spec.MWD, Hs = spec.SwH ?? spec.WVHT, how = '16-pt';
+  try {                                               // refine with spectra: degree-resolution direction at the energy peak
+    const [ds, sw] = await Promise.all([fetchText(base + '.data_spec'), fetchText(base + '.swdir')]);
+    const pk = C.peakFromSpectra(C.parseDataSpec(ds), C.parseSwdir(sw));
+    if (pk) { T = pk.T; from = pk.from; how = 'spectral peak'; }
+  } catch (e) {}
+  if (from == null || T == null || Hs == null) throw new Error('incomplete');
+  return { from, T, Hs, src: 'NDBC ' + st.id, how, distKm: st.km, ageMin };
+}
+async function modelReading() {
+  if (!here) throw new Error('no position');
+  const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${here.lat.toFixed(3)}&longitude=${here.lon.toFixed(3)}` +
+              `&current=swell_wave_height,swell_wave_period,swell_wave_direction`;
+  const j = await (await fetch(url)).json();
+  const c = j.current; if (!c || c.swell_wave_direction == null) throw new Error('no model data');
+  return { from: c.swell_wave_direction, T: c.swell_wave_period, Hs: c.swell_wave_height, src: 'Open-Meteo model', how: 'model', distKm: 0, ageMin: 0 };
+}
+let loading = false;
+async function loadSwell() {
+  if (loading) return; loading = true;
+  try {
+    if (S.src === 'manual') { swell = { from: S.mDir, T: S.mT, Hs: S.mH, src: 'manual', how: 'manual', distKm: 0, ageMin: 0 }; return; }
+    if (!here) { setStatus('Waiting for GPS…'); return; }
+    if (S.src === 'auto') {
+      try {
+        const list = S.buoy ? [{ id: S.buoy, km: NaN }] : await nearestStations(here.lat, here.lon);
+        for (const st of list) { try { swell = await buoyReading(st); setStatus(''); return; } catch (e) {} }
+        throw new Error('no buoy with fresh wave data');
+      } catch (e) { setStatus('Buoy unavailable (' + e.message + ') – using model. If this is a CORS error, set a proxy in Settings.'); }
+    }
+    try { swell = await modelReading(); } catch (e) { setStatus('No wave data: ' + e.message); }
+  } finally { loading = false; }
+}
+$('refresh').onclick = loadSwell;
+setInterval(loadSwell, 15 * 60e3);
+
+// ---------- sensors ----------
+const screenAngle = () => screen.orientation ? screen.orientation.angle : ((window.orientation || 0) + 360) % 360;
+const yawTotal = () => (S.decl || 0) + (S.trim || 0);
+function setEuler(a, b, g, cmp) {
+  rawEuler = [a, b, g];
+  let yaw = 0;
+  if (cmp != null && !isNaN(cmp)) {                    // iOS: alpha is relative; align it to the compass heading
+    const hRaw = C.headingOf(C.poseFromEuler(a, b, g, screenAngle(), 0).f);
+    const d = C.angdiff(cmp, hRaw);
+    yawIOS = yawIOS == null ? d : yawIOS + 0.1 * C.angdiff(d, yawIOS);
+    yaw = yawIOS;
+  }
+  const p = C.poseFromEuler(a, b, g, screenAngle(), yaw + yawTotal());
+  pose = pose ? { f: C.norm(pose.f.map((x, i) => x + 0.4 * (p.f[i] - x))), u: C.norm(pose.u.map((x, i) => x + 0.4 * (p.u[i] - x))) } : p;
+}
+window.addEventListener('deviceorientationabsolute', e => { if (e.alpha == null) return; absSeen = true; setEuler(e.alpha, e.beta, e.gamma, null); }, true);
+window.addEventListener('deviceorientation', e => { if (absSeen || e.alpha == null) return; setEuler(e.alpha, e.beta, e.gamma, e.webkitCompassHeading); }, true);
+
+async function start() {
+  $('start').classList.add('hide');
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) await DeviceOrientationEvent.requestPermission();
+  } catch (e) { setStatus('Motion permission denied'); }
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 } }, audio: false });
+    video.srcObject = st; await video.play();
+  } catch (e) { setStatus('Camera unavailable: ' + e.message); }
+  navigator.geolocation.watchPosition(p => {
+    const first = !here;
+    here = { lat: p.coords.latitude, lon: p.coords.longitude };
+    if (first) loadSwell();
+  }, e => setStatus('Location: ' + e.message), { enableHighAccuracy: true, maximumAge: 10000 });
+  try { await document.documentElement.requestFullscreen(); await screen.orientation.lock('landscape'); } catch (e) {}
+}
+$('go').onclick = start;
+$('demo').onclick = () => { $('start').classList.add('hide'); demoMode = true; here = { lat: 34.27, lon: -119.3 }; S.src === 'auto' && (S.src = 'manual'); loadSwell();
+  let down = null;
+  cv.addEventListener('pointerdown', e => down = e.clientX);
+  cv.addEventListener('pointermove', e => { if (down != null) { demoHeading = C.mod360(demoHeading + (e.clientX - down) * 0.2); down = e.clientX; } });
+  addEventListener('pointerup', () => down = null);
+  setStatus('Demo: drag left/right to turn. Use Settings → Manual to change the swell.'); };
+
+// ---------- UI ----------
+$('gear').onclick = () => $('panel').classList.toggle('open');
+$('closep').onclick = () => $('panel').classList.remove('open');
+const curHeading = () => demoMode ? demoHeading : (pose ? C.headingOf(pose.f) : null);
+$('shore').onclick = () => { const h = curHeading(); if (h == null) return; S.seaward = Math.round(h); save(); };
+$('clearShore').onclick = () => { S.seaward = null; save(); };
+$('calib').onclick = () => {
+  const k = parseFloat($('known').value); if (isNaN(k) || !pose) return;
+  S.trim = Math.round(C.angdiff(k, C.headingOf(pose.f)) + (S.trim || 0)); $('trim').value = S.trim; save(); pose = null;
+};
+
+// ---------- render ----------
+function resize() { const d = Math.min(devicePixelRatio || 1, 2); cv.width = innerWidth * d; cv.height = innerHeight * d; }
+addEventListener('resize', resize); resize();
+
+function nearshore() {
+  if (!swell) return null;
+  const T = Math.max(swell.T, 3);
+  const from = C.refract(swell.from, S.seaward, T, S.hLocal, S.hBuoy);
+  return { from, T, wp: C.waveProps(T, S.hLocal) };
+}
+function backdrop(W, H, pitch) {
+  const hy = H/2 + (W/2)/Math.tan(S.fov*C.D2R/2) * Math.tan(pitch*C.D2R);   // looking down (pitch<0) moves the horizon up
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#6aa9c9'); g.addColorStop(Math.min(Math.max(hy/H,0.01),0.99), '#cfe6f1'); g.addColorStop(Math.min(Math.max(hy/H,0.01),0.99)+0.001, '#14607a'); g.addColorStop(1, '#06263a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  const W = cv.width, H = cv.height, t = now / 1000;
+  ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, W, H);
+  let ps = pose;
+  if (demoMode) ps = C.poseFromHeadingPitch(demoHeading, -8);
+  if (demoMode) backdrop(W, H, -8);
+  const ns = nearshore(); const heading = ps ? C.headingOf(ps.f) : null;
+  const ft = x => (x * M2FT).toFixed(1);
+  if (swell && ns) {
+    $('line1').innerHTML = `<b>${ft(swell.Hs)} ft @ ${swell.T.toFixed(0)} s</b> from <b>${Math.round(swell.from)}° ${C.compassName(swell.from)}</b>` +
+      (S.seaward != null ? ` → <b>${Math.round(ns.from)}°</b> at the beach` : '');
+    $('line2').textContent = `${swell.src}` + (swell.distKm ? ` · ${Math.round(swell.distKm)} km` : '') + (swell.ageMin ? ` · ${Math.round(swell.ageMin)} min old` : '') + ` · ${swell.how}` +
+      (heading != null ? ` · facing ${Math.round(heading)}°` : '');
+  } else $('line1').innerHTML = '<b>SwellAR</b>';
+  if (!ps || !swell || !ns) return;
+
+  // compass arrow: direction of travel relative to where the camera points (up = away from you)
+  const travel = ns.from + 180;
+  $('arrow').setAttribute('transform', `rotate(${C.angdiff(travel, heading)})`);
+
+  const fpx = (W/2) / Math.tan(S.fov * C.D2R / 2), camH = S.camh, Smax = 450;
+  const th = travel * C.D2R, p = [Math.sin(th), Math.cos(th)], q = [Math.cos(th), -Math.sin(th)];
+  const k = S.scale, Ls = ns.wp.L * k, vs = ns.wp.c * k, vg = ns.wp.cg * k, Lg = Ls * 7;
+  const amp = Math.min(1, 0.45 + swell.Hs / 3);
+  const phase = ((vs * t) % Ls + Ls) % Ls;
+  ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'butt';
+  for (let s = phase - Math.ceil(Smax / Ls) * Ls; s <= Smax; s += Ls) {
+    const env = 0.5 + 0.5 * Math.cos(2 * Math.PI * (s - vg * t) / Lg);       // wave groups ("trains") travel at group speed
+    const a = amp * (0.12 + 0.88 * Math.pow(env, 1.6));
+    if (a < 0.03) continue;
+    let prev = null;
+    for (let u = -Smax; u <= Smax;) {
+      const r = Math.hypot(s, u), fade = 1 - Math.pow(r / Smax, 1.2);
+      const P = [s*p[0] + u*q[0], s*p[1] + u*q[1], -camH];
+      const pr = fade > 0 ? C.project(P, ps, W, H, fpx) : null;
+      if (pr && prev) {
+        const w = Math.max(2, Math.min(12, fpx * 0.5 / pr[2]));
+        ctx.strokeStyle = `rgba(90,200,240,${(0.8 * a * fade).toFixed(3)})`; ctx.lineWidth = w;
+        ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(pr[0], pr[1]); ctx.stroke();
+      }
+      prev = pr; u += Math.max(3, Math.min(40, 0.12 * r));
+    }
+  }
+}
+requestAnimationFrame(frame);
+window.__swellar = { setDemo(o) { demoMode = true; $('start').classList.add('hide'); if (o.heading != null) demoHeading = o.heading;
+  if (o.swell) swell = Object.assign({ src: 'test', how: 'test', distKm: 0, ageMin: 0 }, o.swell); if (o.seaward !== undefined) S.seaward = o.seaward; } };
+})();
+</script>
+</body>
+</html>
