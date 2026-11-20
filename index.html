@@ -61,7 +61,8 @@
 
 <div id="panel">
   <h3>Wave data</h3>
-  <label>Source <select id="src"><option value="auto">Buoy (NDBC), model fallback</option><option value="model">Model (Open-Meteo)</option><option value="manual">Manual</option></select></label>
+  <label>Source <select id="src"><option value="auto">Auto: CDIP nearby, else NDBC, else model</option><option value="cdip">CDIP station</option><option value="model">Model (Open-Meteo)</option><option value="manual">Manual</option></select></label>
+  <label>CDIP station # <input id="cdip" placeholder="169"></label>
   <label>Buoy ID (optional) <input id="buoy" placeholder="e.g. 46025"></label>
   <label>CORS proxy URL <input id="proxy" placeholder="https://…/?u="></label>
   <div id="manualBox" class="hide">
@@ -197,6 +198,24 @@ const SwellCore = (() => {
     return { T: 1/pk.f, from: mod360(d.v) };
   }
 
+  // CDIP THREDDS NetCDF-Subset CSV: header like  time,latitude[unit="..."],waveHs[unit="meter"],waveTp[...],waveDp[...]
+  function splitCsv(l) { const out = []; let cur = '', q = false;
+    for (const ch of l) { if (ch === '"') q = !q; else if (ch === ',' && !q) { out.push(cur); cur = ''; } else cur += ch; }
+    out.push(cur); return out; }
+  function parseNcssCsv(txt) {                          // newest valid row -> {time, Hs, Tp, Dp}
+    const lines = txt.split(/\r?\n/).filter(l => l.trim()); if (lines.length < 2) return null;
+    const head = splitCsv(lines[0]).map(h => h.trim().replace(/^"|"$/g, ''));
+    const col = n => head.findIndex(h => h === n || h.startsWith(n + '['));
+    const iT = col('time'), iH = col('waveHs'), iP = col('waveTp'), iD = col('waveDp');
+    if ([iT, iH, iP, iD].includes(-1)) return null;
+    const ok = x => Number.isFinite(x) && x > -90;      // CDIP fill values are -999.99
+    for (let i = lines.length - 1; i >= 1; i--) {
+      const c = splitCsv(lines[i]), Hs = +c[iH], Tp = +c[iP], Dp = +c[iD], time = Date.parse(c[iT]);
+      if (ok(Hs) && ok(Tp) && ok(Dp) && Tp > 0 && Dp >= 0 && Dp <= 360 && Number.isFinite(time)) return { time, Hs, Tp, Dp: mod360(Dp) };
+    }
+    return null;
+  }
+
   const haversineKm = (a, b, c, d) => {
     const p = x => x*D2R, dl = p(d-b), dp = p(c-a);
     const h = Math.sin(dp/2)**2 + Math.cos(p(a))*Math.cos(p(c))*Math.sin(dl/2)**2;
@@ -205,7 +224,7 @@ const SwellCore = (() => {
 
   return { D2R, R2D, mod360, angdiff, dot, cross, norm, rotFromEuler, rotYaw, poseFromEuler, poseFromHeadingPitch,
            headingOf, pitchOf, project, waveProps, refract, compassName, parseSpec, parseDataSpec, parseSwdir,
-           peakFromSpectra, haversineKm };
+           peakFromSpectra, parseNcssCsv, haversineKm };
 })();
 if (typeof module !== 'undefined') module.exports = SwellCore;
 </script>
@@ -219,7 +238,7 @@ const cv = $('cv'), ctx = cv.getContext('2d'), video = $('video');
 const M2FT = 3.28084;
 
 // ---------- settings ----------
-const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, hLocal:4, hBuoy:300, scale:0.3,
+const defaults = { src:'auto', cdip:'169', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, hLocal:4, hBuoy:300, scale:0.3,
                    mDir:270, mT:14, mH:1.5, seaward:null };
 let S = Object.assign({}, defaults);
 try { Object.assign(S, JSON.parse(localStorage.getItem('swellar') || '{}')); } catch (e) {}
@@ -229,7 +248,7 @@ const bind = (id, key, isNum = true, after) => {
   el.addEventListener('input', () => { S[key] = isNum ? (el.value === '' ? null : +el.value) : el.value; save(); after && after(); });
 };
 bind('src','src',false,()=>{ $('manualBox').classList.toggle('hide', S.src!=='manual'); loadSwell(); });
-bind('buoy','buoy',false); bind('proxy','proxy',false);
+bind('buoy','buoy',false); bind('cdip','cdip',false); bind('proxy','proxy',false);
 bind('mDir','mDir'); bind('mT','mT'); bind('mH','mH');
 bind('hLocal','hLocal'); bind('hBuoy','hBuoy'); bind('decl','decl'); bind('trim','trim');
 bind('fov','fov',true,()=>$('fovv').textContent=S.fov); bind('camh','camh');
@@ -279,6 +298,20 @@ async function buoyReading(st) {
   if (from == null || T == null || Hs == null) throw new Error('incomplete');
   return { from, T, Hs, src: 'NDBC ' + st.id, how, distKm: st.km, ageMin };
 }
+// CDIP stations with known depth (verified from CDIP's station page). Others work too, using the "buoy depth" setting.
+const CDIP_KNOWN = { '169': { lat: 34.250917, lon: -119.307783, depth: 18.29, name: 'Ventura Nearshore' } };
+async function cdipReading(id, km) {
+  id = String(id).padStart(3, '0');
+  const iso = ms => new Date(ms).toISOString().slice(0, 19) + 'Z';
+  const url = `https://thredds.cdip.ucsd.edu/thredds/ncss/point/cdip/realtime/${id}p1_rt.nc?var=waveHs&var=waveTp&var=waveDp` +
+              `&time_start=${iso(Date.now() - 3*3600e3)}&time_end=${iso(Date.now() + 3600e3)}&accept=csv`;
+  const r = C.parseNcssCsv(await fetchText(url));
+  if (!r) throw new Error('no recent CDIP data');
+  const ageMin = (Date.now() - r.time) / 60000;
+  if (ageMin > 240) throw new Error('stale');
+  const k = CDIP_KNOWN[id];
+  return { from: r.Dp, T: r.Tp, Hs: r.Hs, src: 'CDIP ' + id + (k ? ' ' + k.name : ''), how: 'peak direction', distKm: km, ageMin, depth: k ? k.depth : undefined };
+}
 async function modelReading() {
   if (!here) throw new Error('no position');
   const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${here.lat.toFixed(3)}&longitude=${here.lon.toFixed(3)}` +
@@ -293,7 +326,15 @@ async function loadSwell() {
   try {
     if (S.src === 'manual') { swell = { from: S.mDir, T: S.mT, Hs: S.mH, src: 'manual', how: 'manual', distKm: 0, ageMin: 0 }; return; }
     if (!here) { setStatus('Waiting for GPS…'); return; }
+    if (S.src === 'cdip') {
+      try { const k = CDIP_KNOWN[S.cdip]; swell = await cdipReading(S.cdip, k ? C.haversineKm(here.lat, here.lon, k.lat, k.lon) : 0); setStatus(''); return; }
+      catch (e) { setStatus('CDIP unavailable (' + e.message + '). If this is a CORS error, set a proxy in Settings.'); return; }
+    }
     if (S.src === 'auto') {
+      for (const [id, k] of Object.entries(CDIP_KNOWN)) {           // a nearshore CDIP buoy within 30 km beats an offshore NDBC one
+        const km = C.haversineKm(here.lat, here.lon, k.lat, k.lon);
+        if (km < 30) { try { swell = await cdipReading(id, km); setStatus(''); return; } catch (e) {} }
+      }
       try {
         const list = S.buoy ? [{ id: S.buoy, km: NaN }] : await nearestStations(here.lat, here.lon);
         for (const st of list) { try { swell = await buoyReading(st); setStatus(''); return; } catch (e) {} }
@@ -366,7 +407,7 @@ addEventListener('resize', resize); resize();
 function nearshore() {
   if (!swell) return null;
   const T = Math.max(swell.T, 3);
-  const from = C.refract(swell.from, S.seaward, T, S.hLocal, S.hBuoy);
+  const from = C.refract(swell.from, S.seaward, T, S.hLocal, swell.depth ?? S.hBuoy);
   return { from, T, wp: C.waveProps(T, S.hLocal) };
 }
 function backdrop(W, H, pitch) {
