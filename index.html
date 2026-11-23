@@ -17,6 +17,11 @@
   #compass{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));width:84px;height:84px;pointer-events:none}
   #btns{position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px}
   button{font:inherit;color:#fff;background:#0b3a52cc;border:1px solid #6cc7ee88;border-radius:10px;padding:8px 12px}
+  button{transition:background .15s,border-color .15s,transform .1s}
+  button:active{transform:scale(.96);background:#0a7aa8}
+  button.ok{background:#1a8f4c;border-color:#7be4a8}
+  button.err{background:#a83232;border-color:#f09a9a}
+  button.busy{background:#8a6d0a;border-color:#f0d27a}
   button.primary{background:#0a7aa8;font-size:16px;padding:12px 20px}
   #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
          background:radial-gradient(#0b3a52,#02121a);text-align:center;padding:24px}
@@ -389,7 +394,19 @@ async function loadSwell() {
     try { swell = await modelReading(); } catch (e) { setStatus('No wave data: ' + e.message); }
   } finally { loading = false; }
 }
-$('refresh').onclick = loadSwell;
+// Brief on-button acknowledgement: label + colour (busy = amber, ok = green, err = red), then back to normal.
+function ack(btn, text, kind, ms = 1600) {
+  if (btn.dataset.label === undefined) btn.dataset.label = btn.textContent;
+  clearTimeout(btn._t);
+  btn.textContent = text; btn.classList.remove('ok', 'err', 'busy'); btn.classList.add(kind);
+  if (ms) btn._t = setTimeout(() => { btn.textContent = btn.dataset.label; btn.classList.remove('ok', 'err', 'busy'); }, ms);
+}
+$('refresh').onclick = async () => {
+  const b = $('refresh'); ack(b, 'Refreshing…', 'busy', 0); setStatus('');
+  await loadSwell();
+  const bad = $('status').textContent;
+  bad ? ack(b, 'Failed – see top of screen', 'err', 2500) : ack(b, 'Updated ✓', 'ok');
+};
 setInterval(loadSwell, 15 * 60e3);
 
 // ---------- sensors ----------
@@ -438,11 +455,17 @@ $('demo').onclick = () => { $('start').classList.add('hide'); demoMode = true; h
 $('gear').onclick = () => $('panel').classList.toggle('open');
 $('closep').onclick = () => $('panel').classList.remove('open');
 const curHeading = () => demoMode ? demoHeading : (pose ? C.headingOf(pose.f) : null);
-$('shore').onclick = () => { const h = curHeading(); if (h == null) return; S.seaward = Math.round(h); save(); };
-$('clearShore').onclick = () => { S.seaward = null; save(); };
+$('shore').onclick = () => {
+  const h = curHeading(); if (h == null) return ack($('shore'), 'No compass yet', 'err');
+  S.seaward = Math.round(h); save(); ack($('shore'), 'Sea set: ' + S.seaward + '° ✓', 'ok');
+};
+$('clearShore').onclick = () => { S.seaward = null; save(); ack($('clearShore'), 'Cleared ✓', 'ok'); };
 $('calib').onclick = () => {
-  const k = parseFloat($('known').value); if (isNaN(k) || !pose) return;
+  const k = parseFloat($('known').value);
+  if (isNaN(k)) return ack($('calib'), 'Enter a bearing first', 'err');
+  if (!pose) return ack($('calib'), 'No compass yet', 'err');
   S.trim = Math.round(C.angdiff(k, C.headingOf(pose.f)) + (S.trim || 0)); $('trim').value = S.trim; save(); pose = null;
+  ack($('calib'), 'Calibrated ✓', 'ok');
 };
 
 // ---------- render ----------
