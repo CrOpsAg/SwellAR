@@ -104,4 +104,26 @@ assert(C.partitionSpectrum(sf, [0,0,0,0,0,0,0,0,0], sD).length === 0, 'empty spe
 // (d) NDBC alignment
 const al = C.alignSpectra({ pairs: [{v:0.1,f:0.05},{v:0.5,f:0.06},{v:0.2,f:0.07},{v:0.1,f:0.08}] }, { pairs: [{v:200,f:0.05},{v:201,f:0.06},{v:202,f:0.07},{v:203,f:0.08}] });
 assert.deepStrictEqual(al.D, [200,201,202,203]);
+// 10. measuring: foam score, period estimator, ground inversion, tap-to-sync
+// (a) foam score: 25% of pixels white foam on blue water -> ~0.25; plain water -> ~0
+const px = (r, g, b) => [r, g, b, 255]; const patch = []; for (let i = 0; i < 400; i++) patch.push(...(i < 100 ? px(235, 240, 245) : px(20, 90, 120)));
+close(C.foamScore(Uint8ClampedArray.from(patch)).foam, 0.25, 0.01, 'foam fraction'); close(C.foamScore(Uint8ClampedArray.from(Array(400).fill(0).flatMap(() => px(20, 90, 120)))).foam, 0, 1e-9, 'no foam');
+// (b) period estimator on jittered synthetic breakers (seeded), with irregular timestamps
+let sd = 7; const rn = () => (sd = (sd * 1664525 + 1013904223) >>> 0) / 4294967296; const gs = () => Math.sqrt(-2 * Math.log(rn() + 1e-12)) * Math.cos(2 * Math.PI * rn());
+const T0 = 12.5, ev = []; for (let t = 3; t < 190; t += T0 * (1 + 0.3 * (rn() - 0.5))) ev.push([t, 0.6 + rn()]);
+const tts = [], tv = []; for (let t = 0; t < 180; t += 0.2 + 0.05 * rn()) { tts.push(t); tv.push(ev.reduce((a, [e, am]) => a + am * Math.exp(-((t - e) ** 2) / (2 * 1.3 ** 2)), 0) + 0.4 * gs()); }
+const pe = C.periodFromSeries(tts, tv); close(pe.T, T0, 1.0, 'estimated period'); assert.strictEqual(C.periodConfidence(pe.prominence), 'clear', 'real rhythm is clear: ' + pe.prominence);
+assert(pe.nWaves >= 8 && pe.nWaves <= 18, 'waves counted: ' + pe.nWaves); assert(pe.sigma > 0.5 && pe.sigma < 1.5, 'sigma ~ T^2/dur');
+const nz = C.periodFromSeries(tts, tts.map(() => gs())); assert(C.periodConfidence(nz.prominence) !== 'clear', 'pure noise must not be "clear": ' + nz.prominence);
+assert.strictEqual(C.periodFromSeries([0, 1, 2], [1, 2, 3]), null, 'too short -> null');
+// (c) ground-point inversion round trip through project()
+const gp = C.poseFromHeadingPitch(40, -6), gW = 1000, gH = 500, gf = (gW / 2) / Math.tan(32.5 * Math.PI / 180);
+const P = [30, 55, -3], pj = C.project(P, gp, gW, gH, gf), back = C.groundFromPixel(pj[0], pj[1], gp, gW, gH, gf, 3);
+close(back[0], 30, 1e-6, 'ground E'); close(back[1], 55, 1e-6, 'ground N'); assert.strictEqual(C.groundFromPixel(500, 100, C.poseFromHeadingPitch(0, 5), gW, gH, gf, 3), null, 'sky pixel -> null');
+// (d) tap-to-sync: taps at the moments a crest reaches sG must reproduce the drawing phase
+const vs = 2.1, Tp = 11, Ls = vs * Tp, sG = 47.3, tau0 = 4.4, taps = [0, 1, 2, 3, 5].map(m => tau0 + sG / vs + m * Tp + 0.05 * (m % 2 ? 1 : -1));
+const ph = C.phaseOffset(taps, sG, vs, Tp); const dm = (a, b, m) => Math.abs(((a - b + m / 2) % m + m) % m - m / 2);
+close(dm(ph.tau, tau0, Tp), 0, 0.1, 'recovered tau'); assert(ph.R > 0.99, 'consistent taps -> R ~ 1');
+const crestAtTap = ((vs * (taps[2] - ph.tau)) % Ls + Ls) % Ls; close(dm(crestAtTap, sG, Ls), 0, 0.3, 'drawn crest sits at the marked spot at tap time');
+assert(C.phaseOffset([0.0, 2.8, 5.5, 8.3], 0, 1, 11).R < 0.6, 'scattered taps -> low R');
 console.log('all tests passed');

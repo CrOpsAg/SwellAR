@@ -13,6 +13,23 @@
   #hud{position:fixed;left:0;right:0;top:0;padding:env(safe-area-inset-top) 12px 8px;pointer-events:none;
        background:linear-gradient(#000a,#0000);text-shadow:0 1px 3px #000}
   #hud b{font-weight:600}
+  canvas{touch-action:none}
+  #btns{z-index:4;flex-wrap:wrap;max-width:62vw}
+  #mcard{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(60px + env(safe-area-inset-bottom));width:min(430px,92vw);max-height:62vh;overflow:auto;
+         background:#04161ff0;border:1px solid #6cc7ee66;border-radius:14px;padding:10px 12px;z-index:4;font-size:13px}
+  #mcard canvas{position:static;inset:auto;display:block;pointer-events:none}
+  #mcard .mt{font-weight:600;margin-bottom:4px}
+  #mcard .ms{opacity:.8;margin:3px 0}
+  #mcard .big{font-size:20px;font-weight:600}
+  #mcard .big small{font-size:13px;opacity:.7;font-weight:400}
+  #mcard .ok{color:#7be4a8;margin:3px 0}
+  #mcard .warn{color:#ffd27a;margin:3px 0}
+  #mcard .mrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  #mcard button.go{background:#0a7aa8}
+  .bar{height:6px;background:#ffffff22;border-radius:3px;overflow:hidden;margin:6px 0}
+  .bar i{display:block;height:100%;width:0;background:#ffd24a}
+  #tapcap{position:fixed;inset:0;z-index:3;background:transparent;transition:background .1s}
+  #tapcap.flash{background:#ffffff26}
   #more{font-size:12px;line-height:1.5}
   #status{opacity:.75;font-size:12px}
   #compass{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));width:84px;height:84px;pointer-events:none}
@@ -56,8 +73,12 @@
 
 <div id="btns">
   <button id="gear">⚙ Settings</button>
+  <button id="measure">📏 Measure period</button>
   <button id="shore" title="Face straight out to sea, then tap">⛱ Set sea direction</button>
 </div>
+
+<div id="mcard" class="hide"></div>
+<div id="tapcap" class="hide"></div>
 
 <div id="start">
   <h1>🌊 SwellAR</h1>
@@ -293,6 +314,73 @@ const SwellCore = (() => {
     return f.length > 3 ? { f, E, D } : null;
   }
 
+  // ---- measuring the real wave period from camera frames ----
+  // Foam score for the patch the user marked. d = RGBA bytes. Foam = clearly brighter than the patch median and nearly colourless.
+  function foamScore(d) {
+    const n = d.length / 4, hist = new Uint32Array(256), L = new Float32Array(n); let sum = 0;
+    for (let i = 0; i < n; i++) { const l = 0.299*d[4*i] + 0.587*d[4*i+1] + 0.114*d[4*i+2]; L[i] = l; hist[l | 0]++; sum += l; }
+    let acc = 0, med = 0; for (let b = 0; b < 256; b++) { acc += hist[b]; if (acc >= n / 2) { med = b; break; } }
+    let foam = 0;
+    for (let i = 0; i < n; i++) {
+      const r = d[4*i], g = d[4*i+1], b = d[4*i+2], mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+      if (L[i] > med + 30 && mx - mn < 0.45 * mx) foam++;
+    }
+    return { foam: foam / n, lum: sum / n };
+  }
+  function resample(ts, v, fs) {                        // irregular timestamps (s) -> uniform grid at fs Hz
+    const t0 = ts[0], n = Math.floor((ts[ts.length - 1] - t0) * fs) + 1, out = new Array(n); let j = 0;
+    for (let i = 0; i < n; i++) {
+      const t = t0 + i / fs; while (j < ts.length - 2 && ts[j+1] < t) j++;
+      const a = ts[j], b = ts[j+1], w = Math.min(1, Math.max(0, (t - a) / ((b - a) || 1)));
+      out[i] = v[j] + (v[j+1] - v[j]) * w;
+    }
+    return out;
+  }
+  // Dominant rhythm of a brightness/foam time series. prominence = peak power / median power of the spectrum.
+  function periodFromSeries(ts, v, opts) {
+    const o = Object.assign({ fs: 5, Tmin: 4, Tmax: 25, df: 0.0005 }, opts);
+    if (!ts || ts.length < 20) return null;
+    let x = resample(ts, v, o.fs); const n = x.length, dur = n / o.fs; if (dur < 30) return null;
+    const win = (Math.round(2 * o.Tmax * o.fs) | 1), h = win >> 1;   // drop slow drift (exposure, tide, light)
+    const y = new Array(n);
+    for (let i = 0; i < n; i++) { const a = Math.max(0, i - h), b = Math.min(n - 1, i + h); let s = 0; for (let k = a; k <= b; k++) s += x[k]; y[i] = x[i] - s / (b - a + 1); }
+    const w = y.map((yi, i) => yi * 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1))));
+    const P = [];
+    for (let f = 1 / o.Tmax; f <= 1 / o.Tmin + 1e-12; f += o.df) {
+      let re = 0, im = 0; const wf = 2 * Math.PI * f / o.fs;
+      for (let i = 0; i < n; i++) { re += w[i] * Math.cos(wf * i); im += w[i] * Math.sin(wf * i); }
+      P.push({ f, p: re * re + im * im });
+    }
+    const pk = P.reduce((a, b) => b.p > a.p ? b : a), sorted = P.map(q => q.p).sort((a, b) => a - b), med = sorted[sorted.length >> 1] || 1e-12;
+    const T = 1 / pk.f;
+    // count visible wave events: peaks of the 2 s smoothed signal, >= 3 s apart, clearly above average
+    const m = Math.max(1, Math.round(2 * o.fs)), sm = y.map((_, i) => { let s = 0, c = 0; for (let k = Math.max(0, i - m); k <= Math.min(n - 1, i + m); k++) { s += y[k]; c++; } return s / c; });
+    const mean = sm.reduce((a, b) => a + b, 0) / n, sd = Math.sqrt(sm.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+    let nWaves = 0, last = -1e9;
+    for (let i = 1; i < n - 1; i++) if (sm[i] > mean + 0.6 * sd && sm[i] >= sm[i-1] && sm[i] > sm[i+1] && (i - last) / o.fs >= 3) { nWaves++; last = i; }
+    return { T, sigma: T * T / dur, prominence: pk.p / med, dur, nWaves };
+  }
+  // Thresholds chosen from simulations: pure noise reaches 11 at its 95th and 16.5 at its 99th percentile.
+  const periodConfidence = prom => prom >= 20 ? 'clear' : prom >= 12 ? 'possible' : 'none';
+  // Which ground point (east, north; camera at the origin, sea surface camH below) does a screen pixel see?
+  function groundFromPixel(px, py, pose, W, H, fpx, camH) {
+    const r = cross(pose.f, pose.u), a = (px - W/2) / fpx, b = -(py - H/2) / fpx;
+    const d = [pose.f[0] + a*r[0] + b*pose.u[0], pose.f[1] + a*r[1] + b*pose.u[1], pose.f[2] + a*r[2] + b*pose.u[2]];
+    if (d[2] > -1e-3) return null;                       // at or above the horizon
+    const k = -camH / d[2]; return [k * d[0], k * d[1]];
+  }
+  // Tap-to-sync: crests are drawn at s = ((vs*(t - tau)) mod Ls) + k*Ls. Find tau so a crest reaches the marked spot (coordinate sG
+  // along the travel direction) at each tap time. Circular mean over one wave period; R in [0,1] tells how consistent the taps were.
+  function phaseOffset(tapTimes, sG, vs, Tpulse) {
+    let sx = 0, cx = 0;
+    for (const t of tapTimes) {
+      const within = (((t - sG / vs) % Tpulse) + Tpulse) % Tpulse, a = 2 * Math.PI * within / Tpulse;   // position within one wave period
+      sx += Math.sin(a); cx += Math.cos(a);
+    }
+    const n = tapTimes.length;
+    return { tau: ((Math.atan2(sx, cx) / (2 * Math.PI)) * Tpulse + Tpulse) % Tpulse, R: Math.hypot(sx, cx) / n };
+  }
+
   const haversineKm = (a, b, c, d) => {
     const p = x => x*D2R, dl = p(d-b), dp = p(c-a);
     const h = Math.sin(dp/2)**2 + Math.cos(p(a))*Math.cos(p(c))*Math.sin(dl/2)**2;
@@ -301,7 +389,7 @@ const SwellCore = (() => {
 
   return { D2R, R2D, mod360, angdiff, dot, cross, norm, rotFromEuler, rotYaw, poseFromEuler, poseFromHeadingPitch,
            headingOf, pitchOf, project, waveProps, refract, compassName, parseSpec, parseDataSpec, parseSwdir,
-           peakFromSpectra, parseNcssCsv, parseDapArray, nearestIndex, partitionSpectrum, applyOfficial, alignSpectra, bandwidths, haversineKm };
+           peakFromSpectra, parseNcssCsv, parseDapArray, nearestIndex, partitionSpectrum, applyOfficial, alignSpectra, bandwidths, foamScore, resample, periodFromSeries, periodConfidence, groundFromPixel, phaseOffset, haversineKm };
 })();
 if (typeof module !== 'undefined') module.exports = SwellCore;
 </script>
@@ -548,6 +636,169 @@ $('calib').onclick = () => {
   ack($('calib'), 'Calibrated ✓', 'ok');
 };
 
+// ---------- measure the real wave period + tap-to-sync ----------
+const M = { state: 'off', patch: { x: 0.5, y: 0.6, w: 0.3, h: 0.2 }, ts: [], foam: [], lum: [], t0: 0, dur: 180, steadyT: 0, totalT: 0,
+            obs: null, useObs: false, sync: null, taps: [], sim: null, timer: null, rate: 0, prim: null, pose: null, fpx: 1, modelT: null,
+            lastF: null, lastT: 0, msg: '' };
+const RT = 0.25;                                                   // typical delay between seeing a wave break and tapping
+const clock = () => M.sim ? M.sim.vt : performance.now() / 1000;
+const probe = document.createElement('canvas'); probe.width = 48; probe.height = 32;
+const pctx = probe.getContext('2d', { willReadFrequently: true });
+const mmss = s => Math.max(0, Math.floor(s / 60)) + ':' + String(Math.max(0, Math.floor(s % 60))).padStart(2, '0');
+let wake = null;
+async function keepAwake(on) { try { if (on) wake = await navigator.wakeLock.request('screen'); else if (wake) { await wake.release(); wake = null; } } catch (e) {} }
+
+function patchVideoRect() {                                         // marked patch (screen fractions) -> pixels of the camera image
+  const vw = video.videoWidth, vh = video.videoHeight; if (!vw) return null;
+  const W = innerWidth, H = innerHeight, sc = Math.max(W / vw, H / vh), ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2, p = M.patch;
+  const x = (p.x - p.w / 2) * W, y = (p.y - p.h / 2) * H, rx = Math.max(0, (x - ox) / sc), ry = Math.max(0, (y - oy) / sc);
+  return { x: rx, y: ry, w: Math.min(vw - rx, p.w * W / sc), h: Math.min(vh - ry, p.h * H / sc) };
+}
+function sampleOnce() {
+  let sc;
+  if (M.sim) { M.sim.vt += 0.2; sc = M.sim.fn(M.sim.vt); }
+  else {
+    const r = patchVideoRect(); if (!r || r.w < 2 || r.h < 2) return;
+    try { pctx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, 48, 32); sc = C.foamScore(pctx.getImageData(0, 0, 48, 32).data); } catch (e) { return; }
+  }
+  M.ts.push(clock()); M.foam.push(sc.foam); M.lum.push(sc.lum);
+}
+function trackSteady(now) {                                         // how fast is the camera turning? (deg/s, smoothed)
+  if (!pose) { M.rate = 0; return; }
+  if (M.lastF) {
+    const d = Math.min(1, Math.max(-1, C.dot(pose.f, M.lastF))), dt = (now - M.lastT) / 1000;
+    if (dt > 0 && dt < 0.5) M.rate = M.rate * 0.92 + (Math.acos(d) * C.R2D / dt) * 0.08;
+  }
+  M.lastF = pose.f.slice(); M.lastT = now;
+}
+const isSteady = () => M.rate < 2;
+
+function startMeasure() {
+  Object.assign(M, { ts: [], foam: [], lum: [], steadyT: 0, totalT: 0, obs: null, msg: '', state: 'measuring' });
+  M.t0 = clock(); keepAwake(true);
+  let n = 0;
+  M.timer = setInterval(() => {
+    sampleOnce(); M.totalT += 0.2; if (isSteady()) M.steadyT += 0.2;
+    if (clock() - M.t0 >= M.dur) return finishMeasure();
+    if (++n % 5 === 0) updateCard();
+  }, M.sim ? 4 : 200);
+  renderCard();
+}
+function finishMeasure() {
+  clearInterval(M.timer); M.timer = null; keepAwake(false);
+  const a = C.periodFromSeries(M.ts, M.foam), b = C.periodFromSeries(M.ts, M.lum);
+  const best = [[a, 'whitewater'], [b, 'brightness']].filter(x => x[0]).sort((x, y) => y[0].prominence - x[0].prominence)[0];
+  M.obs = best ? Object.assign({}, best[0], { how: best[1], conf: C.periodConfidence(best[0].prominence), steady: M.totalT ? M.steadyT / M.totalT : 1 }) : null;
+  if (M.obs && M.obs.conf === 'none') M.obs.unusable = true;
+  M.state = 'result'; renderCard();
+}
+function finishSync() {
+  if (M.taps.length < 3) { M.msg = 'Tap at least 3 waves first.'; return updateCard(); }
+  const W = cv.width, H = cv.height, G = M.pose && C.groundFromPixel(M.patch.x * W, M.patch.y * H, M.pose, W, H, M.fpx, S.camh);
+  if (!G || !M.prim) { M.msg = 'Put the box on water below the horizon, then try again.'; return updateCard(); }
+  const sG = G[0] * M.prim.p[0] + G[1] * M.prim.p[1], r = C.phaseOffset(M.taps.map(t => t - RT), sG, M.prim.vs, M.prim.Tp);
+  M.sync = { tau: r.tau, R: r.R, n: M.taps.length, Tp: M.prim.Tp };
+  M.state = 'result'; renderCard();
+}
+
+const act = {
+  smaller: () => { M.patch.w *= 0.85; M.patch.h *= 0.85; },
+  bigger: () => { M.patch.w = Math.min(0.9, M.patch.w * 1.18); M.patch.h = Math.min(0.9, M.patch.h * 1.18); },
+  start: startMeasure,
+  stop: () => { if (clock() - M.t0 < 60) { M.msg = 'Needs at least 1 minute of watching.'; updateCard(); } else finishMeasure(); },
+  cancel: () => { clearInterval(M.timer); M.timer = null; keepAwake(false); M.state = 'ready'; M.msg = ''; renderCard(); },
+  toggleObs: () => { M.useObs = !M.useObs; M.sync = null; renderCard(); },
+  sync: () => { M.state = 'sync'; M.taps = []; M.msg = ''; renderCard(); },
+  done: finishSync,
+  cancelSync: () => { M.state = (M.obs || M.sync) ? 'result' : 'ready'; M.msg = ''; renderCard(); },
+  clearSync: () => { M.sync = null; renderCard(); },
+  again: () => { M.state = 'ready'; M.msg = ''; renderCard(); },
+  close: () => { M.state = 'off'; renderCard(); },
+};
+function renderCard() {
+  const c = $('mcard');
+  if (M.state === 'off') { c.classList.add('hide'); $('tapcap').classList.add('hide'); return; }
+  c.classList.remove('hide'); $('tapcap').classList.toggle('hide', M.state !== 'sync');
+  const b = (a, label, cls = '') => `<button data-act="${a}" class="${cls}">${label}</button>`;
+  let h = '';
+  if (M.state === 'ready') {
+    h = `<div class="mt">Measure the real wave period</div>
+      <div class="ms">Aim at where waves break and drag the box onto the whitewater. Rest the phone on something solid and keep it aimed for 3 minutes.</div>
+      <div class="ms" id="m-steady"></div><div class="warn" id="m-msg"></div>
+      <div class="mrow">${b('smaller', 'Smaller box')}${b('bigger', 'Bigger box')}</div>
+      <div class="mrow">${b('start', 'Start (3:00)', 'go')}${b('sync', 'Just sync')}${b('close', 'Close')}</div>`;
+  } else if (M.state === 'measuring') {
+    h = `<div class="mt">Measuring… <span id="m-left"></span></div><div class="bar"><i id="m-bar"></i></div>
+      <div class="ms" id="m-live"></div><canvas id="m-spark" width="380" height="36" style="width:100%;height:36px"></canvas><div class="warn" id="m-msg"></div>
+      <div class="mrow">${b('stop', 'Stop early')}${b('cancel', 'Cancel')}</div>`;
+  } else if (M.state === 'sync') {
+    h = `<div class="mt">Tap each time a wave breaks in the box</div><div class="big" id="m-taps">0 taps</div>
+      <div class="ms">Tap anywhere on the screen, 4–6 waves is plenty. Waves are irregular, so you can re-sync whenever it drifts.</div><div class="warn" id="m-msg"></div>
+      <div class="mrow">${b('done', 'Done', 'go')}${b('cancelSync', 'Cancel')}</div>`;
+  } else {
+    const o = M.obs, usable = o && !o.unusable, model = M.modelT;
+    h = '<div class="mt">Result</div>';
+    if (!o) h += '<div class="ms">Not enough data. Try again and keep the phone aimed for the full time.</div>';
+    else if (o.unusable) h += '<div class="warn">No clear rhythm found. Try a spot with more breaking whitewater, brace the phone, and measure again.</div>';
+    else {
+      const d = model != null ? Math.abs(o.T - model) : null, tol = Math.max(1.5, o.sigma + 0.5);
+      h += `<div class="big">Observed ${o.T.toFixed(1)} s <small>±${o.sigma.toFixed(1)}</small></div>
+        <div class="ms">${o.nWaves} waves seen · ${o.conf} rhythm (${o.how})${model != null ? ' · model ' + model.toFixed(1) + ' s' : ''}</div>`;
+      if (d != null) h += d <= tol ? '<div class="ok">✓ Matches the model</div>' : `<div class="warn">⚠ Differs from the model by ${d.toFixed(1)} s. Local wind waves, or the model may be off.</div>`;
+      if (o.conf === 'possible') h += '<div class="warn">The rhythm is weak, so treat this as a rough value.</div>';
+      if (o.steady < 0.7) h += '<div class="warn">The phone moved a lot, so this is approximate.</div>';
+    }
+    if (M.sync) h += M.sync.R > 0.8 ? `<div class="ok">✓ Synced to the breakers (${M.sync.n} taps)</div>`
+      : `<div class="warn">Synced, but the taps were scattered (${M.sync.n} taps). Waves may be very irregular. Try re-syncing.</div>`;
+    h += `<div class="warn" id="m-msg"></div><div class="mrow">${usable ? b('toggleObs', M.useObs ? 'Use model period' : 'Use observed period', M.useObs ? '' : 'go') : ''}
+      ${b('sync', M.sync ? 'Re-sync' : 'Tap to sync', usable ? '' : 'go')}${M.sync ? b('clearSync', 'Clear sync') : ''}${b('again', 'Measure again')}${b('close', 'Close')}</div>`;
+  }
+  c.innerHTML = h; updateCard();
+}
+function updateCard() {                                             // cheap in-place updates (no rebuild, so taps on buttons aren't lost)
+  const set = (id, t) => { const e = $(id); if (e) e.textContent = t; };
+  set('m-msg', M.msg || '');
+  if (M.state === 'ready') set('m-steady', isSteady() ? '● Steady' : '● Moving. Brace the phone against something.');
+  if (M.state === 'measuring') {
+    const el = clock() - M.t0; set('m-left', mmss(M.dur - el) + ' left'); const bar = $('m-bar'); if (bar) bar.style.width = Math.min(100, 100 * el / M.dur) + '%';
+    set('m-live', `${isSteady() ? '● steady' : '● moving'} · steady ${Math.round(100 * M.steadyT / Math.max(M.totalT, 0.2))}% of the time`);
+    const sp = $('m-spark'); if (sp) {                              // live trace so you can see the camera is picking up the breakers
+      const g = sp.getContext('2d'), v = M.foam.slice(-300); g.clearRect(0, 0, sp.width, sp.height);
+      const mx = Math.max(...v, 1e-6), mn = Math.min(...v); g.strokeStyle = '#7be4ff'; g.lineWidth = 1.5; g.beginPath();
+      v.forEach((y, i) => { const px = i / 300 * sp.width, py = sp.height - 3 - (y - mn) / ((mx - mn) || 1) * (sp.height - 6); i ? g.lineTo(px, py) : g.moveTo(px, py); }); g.stroke();
+    }
+  }
+  if (M.state === 'sync') set('m-taps', M.taps.length + (M.taps.length === 1 ? ' tap' : ' taps'));
+}
+$('mcard').addEventListener('click', e => { const a = e.target.dataset && e.target.dataset.act; if (a && act[a]) { act[a](); if (a === 'smaller' || a === 'bigger') updateCard(); } });
+$('measure').onclick = () => { if (M.state === 'off') { M.state = M.obs || M.sync ? 'result' : 'ready'; M.msg = ''; } else M.state = 'off'; renderCard(); };
+setInterval(() => { if (M.state === 'ready') updateCard(); }, 400);
+document.addEventListener('pointerdown', e => {                     // any tap counts, except on the card's own buttons
+  if (M.state !== 'sync' || (e.target.closest && e.target.closest('#mcard button'))) return;
+  M.taps.push(performance.now() / 1000); updateCard();
+  const t = $('tapcap'); t.classList.add('flash'); setTimeout(() => t.classList.remove('flash'), 120);
+});
+let drag = null;                                                    // drag the box onto the breaking zone
+cv.addEventListener('pointerdown', e => {
+  if (M.state !== 'ready') return;
+  const p = M.patch, fx = e.clientX / innerWidth, fy = e.clientY / innerHeight;
+  if (Math.abs(fx - p.x) <= p.w / 2 + 0.03 && Math.abs(fy - p.y) <= p.h / 2 + 0.03) drag = { dx: fx - p.x, dy: fy - p.y };
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  M.patch.x = Math.min(1 - M.patch.w / 2, Math.max(M.patch.w / 2, e.clientX / innerWidth - drag.dx));
+  M.patch.y = Math.min(1 - M.patch.h / 2, Math.max(M.patch.h / 2, e.clientY / innerHeight - drag.dy));
+});
+addEventListener('pointerup', () => drag = null);
+function drawPatch() {
+  if (M.state === 'off') return;
+  const W = cv.width, H = cv.height, k = W / innerWidth, p = M.patch, x = (p.x - p.w / 2) * W, y = (p.y - p.h / 2) * H, w = p.w * W, h = p.h * H;
+  ctx.save(); ctx.globalCompositeOperation = 'source-over'; ctx.lineWidth = 2 * k;
+  ctx.strokeStyle = M.state === 'measuring' ? '#ffd24a' : '#ffffffcc'; ctx.setLineDash([10 * k, 6 * k]); ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
+  const cx = x + w / 2, cy = y + h / 2, s = 8 * k; ctx.beginPath(); ctx.moveTo(cx - s, cy); ctx.lineTo(cx + s, cy); ctx.moveTo(cx, cy - s); ctx.lineTo(cx, cy + s); ctx.stroke();
+  ctx.restore();
+}
+
 // ---------- render ----------
 function resize() { const d = Math.min(devicePixelRatio || 1, 2); cv.width = innerWidth * d; cv.height = innerHeight * d; }
 addEventListener('resize', resize); resize();
@@ -605,7 +856,9 @@ function drawTrain(ps, ns, Hs, ampScale, rgb, t, W, H, fpx) {
   }
 }
 function frame(now) {
-  requestAnimationFrame(frame);
+  requestAnimationFrame(frame); trackSteady(now); scene(now); drawPatch();
+}
+function scene(now) {
   const W = cv.width, H = cv.height, t = now / 1000;
   ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, W, H);
   let ps = pose;
@@ -614,28 +867,38 @@ function frame(now) {
   const heading = ps ? C.headingOf(ps.f) : null;
   const ft = x => (x * M2FT).toFixed(1);
   const all = !swell ? [] : (S.multi === false ? [swell] : (swell.parts && swell.parts.length ? swell.parts : [swell]));
-  const parts = all.slice(0, 3), nss = parts.map(nearshore);
-  const row = (p, ns, i) => `<span style="color:${colors[i].hex}">●</span> <b>${ft(p.Hs)} ft @ ${p.T.toFixed(0)} s</b> from <b>${Math.round(p.from)}° ${C.compassName(p.from)}</b>` +
+  M.modelT = all.length ? all[0].T : null;
+  const parts = all.slice(0, 3).map((p, i) => (i === 0 && M.useObs && M.obs && !M.obs.unusable) ? Object.assign({}, p, { T: M.obs.T, obs: true }) : p), nss = parts.map(nearshore);
+  const synced = M.sync && M.prim && Math.abs(M.sync.Tp - M.prim.Tp) < 0.2;
+  const row = (p, ns, i) => `<span style="color:${colors[i].hex}">●</span> <b>${ft(p.Hs)} ft @ ${p.T.toFixed(p.obs ? 1 : 0)} s</b>${p.obs ? ' (observed)' : ''} from <b>${Math.round(p.from)}° ${C.compassName(p.from)}</b>` +
     (ns.sea != null ? ` → <b>${Math.round(ns.from)}°</b> at the beach` : '');
   if (parts.length) {
     $('line1').innerHTML = row(parts[0], nss[0], 0);
     $('more').innerHTML = parts.slice(1).map((p, i) => row(p, nss[i + 1], i + 1)).join('<br>');
-    $('line2').textContent = `${swell.src}` + (swell.distKm ? ` · ${Math.round(swell.distKm)} km` : '') + (swell.ageMin ? ` · ${Math.round(swell.ageMin)} min old` : '') + ` · ${swell.how}` +
+    $('line2').textContent = `${swell.src}` + (swell.distKm ? ` · ${Math.round(swell.distKm)} km` : '') + (swell.ageMin ? ` · ${Math.round(swell.ageMin)} min old` : '') + ` · ${swell.how}` + (synced ? ' · synced to breakers' : '') +
       (heading != null ? ` · facing ${Math.round(heading)}°` : '');
   } else { $('line1').innerHTML = '<b>SwellAR</b>'; $('more').innerHTML = ''; }
   if (!ps || !parts.length) return;
 
+  { const n0 = nss[0], th0 = (n0.from + 180) * C.D2R, k0 = S.scale;      // remember the main swell's geometry for tap-to-sync
+    M.prim = { p: [Math.sin(th0), Math.cos(th0)], vs: n0.wp.c * k0, Tp: n0.wp.L / n0.wp.c }; M.pose = ps; }
+  const tau0 = (M.sync && Math.abs(M.sync.Tp - M.prim.Tp) < 0.2) ? M.sync.tau : 0;   // ignore the sync if the period has since changed
   // compass arrows: direction of travel relative to where the camera points (up = away from you), one per swell
   ['arrow', 'arrow1', 'arrow2'].forEach((id, i) => {
     const el = $(id); el.style.display = i < parts.length ? '' : 'none';
     if (i < parts.length) el.setAttribute('transform', `rotate(${C.angdiff(nss[i].from + 180, heading)})`);
   });
-  const fpx = (W/2) / Math.tan(S.fov * C.D2R / 2), hsMax = Math.max(...parts.map(p => p.Hs), 0.01);
+  const fpx = (W/2) / Math.tan(S.fov * C.D2R / 2); M.fpx = fpx; const hsMax = Math.max(...parts.map(p => p.Hs), 0.01);
   for (let i = parts.length - 1; i >= 0; i--)                     // draw the smaller swells first so the main one sits on top
-    drawTrain(ps, nss[i], parts[i].Hs, Math.max(0.45, Math.sqrt(parts[i].Hs / hsMax)), colors[i].rgb, t, W, H, fpx);
+    drawTrain(ps, nss[i], parts[i].Hs, Math.max(0.45, Math.sqrt(parts[i].Hs / hsMax)), colors[i].rgb, t - (i === 0 ? tau0 : 0), W, H, fpx);
 }
 requestAnimationFrame(frame);
-window.__swellar = { async probe(lat, lon) { here = { lat, lon }; await loadSwell(); return { swell, status: $('status').textContent }; },
+window.__swellar = { M, act, simMeasure(T, snr = 1) {              // test hook: replace the camera with simulated breakers
+    let sd = 99; const rn = () => (sd = (sd * 1664525 + 1013904223) >>> 0) / 4294967296, gs = () => Math.sqrt(-2 * Math.log(rn() + 1e-12)) * Math.cos(2 * Math.PI * rn());
+    const ev = []; for (let t = 2; t < 400; t += T * (1 + 0.3 * (rn() - 0.5))) ev.push([t, 0.6 + rn()]);
+    M.sim = { vt: 0, fn: t => { const f = ev.reduce((a, [e, am]) => a + am * Math.exp(-((t - e) ** 2) / (2 * 1.3 ** 2)), 0) * snr * 0.1 + 0.02 * gs(); return { foam: Math.max(0, f), lum: 100 + 30 * f }; } };
+    M.state = 'ready'; renderCard(); },
+  async probe(lat, lon) { here = { lat, lon }; await loadSwell(); return { swell, status: $('status').textContent }; },
   setDemo(o) { demoMode = true; $('start').classList.add('hide'); if (o.heading != null) demoHeading = o.heading;
   if (o.swell) swell = Object.assign({ src: 'test', how: 'test', distKm: 0, ageMin: 0 }, o.swell); if (o.seaward !== undefined) S.seaward = o.seaward; } };
 })();
