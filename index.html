@@ -13,6 +13,7 @@
   #hud{position:fixed;left:0;right:0;top:0;padding:env(safe-area-inset-top) 12px 8px;pointer-events:none;
        background:linear-gradient(#000a,#0000);text-shadow:0 1px 3px #000}
   #hud b{font-weight:600}
+  #more{font-size:12px;line-height:1.5}
   #status{opacity:.75;font-size:12px}
   #compass{position:fixed;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));width:84px;height:84px;pointer-events:none}
   #btns{position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px}
@@ -43,11 +44,13 @@
 <video id="video" playsinline muted autoplay></video>
 <canvas id="cv"></canvas>
 
-<div id="hud"><div id="line1"><b>SwellAR</b></div><div id="line2"></div><div id="status"></div></div>
+<div id="hud"><div id="line1"><b>SwellAR</b></div><div id="line2"></div><div id="more"></div><div id="status"></div></div>
 
 <svg id="compass" viewBox="-50 -50 100 100">
   <circle r="46" fill="#0008" stroke="#6cc7ee" stroke-opacity=".6"/>
   <text y="-34" text-anchor="middle" font-size="9" fill="#fff" opacity=".7">ahead</text>
+  <g id="arrow2"><path d="M0,-30 L9,-12 L3,-12 L3,24 L-3,24 L-3,-12 L-9,-12 Z" fill="#7be4ff" transform="scale(.6)"/></g>
+  <g id="arrow1"><path d="M0,-30 L9,-12 L3,-12 L3,24 L-3,24 L-3,-12 L-9,-12 Z" fill="#7be4ff" transform="scale(.8)"/></g>
   <g id="arrow"><path d="M0,-30 L9,-12 L3,-12 L3,24 L-3,24 L-3,-12 L-9,-12 Z" fill="#7be4ff"/></g>
 </svg>
 
@@ -88,7 +91,8 @@
   <label>I'm facing true bearing <input id="known" type="number" placeholder="°"></label>
   <div class="row"><button id="calib">Calibrate to that bearing</button></div>
   <label>Horizontal FOV (°) <input id="fov" type="range" min="40" max="100" value="65"><span id="fovv">65</span></label>
-  <label>Pulse color <input id="color" type="color" value="#5ac8f0" style="height:28px;padding:0"></label>
+  <label>Show secondary swells <input id="multi" type="checkbox" checked style="width:auto"></label>
+  <label>Pulse color (main swell) <input id="color" type="color" value="#5ac8f0" style="height:28px;padding:0"></label>
   <label>Camera height (m) <input id="camh" type="number" value="3" step="0.5"></label>
   <label>Pulse spacing × (1 = true scale) <input id="scale" type="range" min="0.1" max="1.5" step="0.05" value="0.3"><span id="scalev">0.3</span></label>
   <div class="row"><button id="closep">Close</button></div>
@@ -240,6 +244,55 @@ const SwellCore = (() => {
     return { i: best, km: bd };
   }
 
+  // ---- split a wave spectrum into separate swell systems ----
+  const bandwidths = f => f.map((x, j) => {
+    const n = f.length, lo = j > 0 ? (x + f[j-1]) / 2 : x - (f[1] - x) / 2, hi = j < n-1 ? (x + f[j+1]) / 2 : x + (x - f[n-2]) / 2;
+    return hi - lo; });
+  const circMean = (angs, w) => { let s = 0, c = 0; angs.forEach((a, i) => { s += w[i] * Math.sin(a*D2R); c += w[i] * Math.cos(a*D2R); }); return mod360(Math.atan2(s, c) * R2D); };
+  // Energy peaks separated by a clear valley (valley < `valley` x the lower peak) are separate systems.
+  function partitionSpectrum(f, E, D, bw, opts) {
+    const o = Object.assign({ valley: 0.75, minHs: 0.1, minFrac: 0.05, max: 3 }, opts), n = f.length;
+    if (n < 3 || E.length !== n || D.length !== n) return [];
+    const w = (bw && bw.length === n) ? bw : bandwidths(f);
+    const e = E.map(x => (Number.isFinite(x) && x > 0) ? x : 0);
+    const total = e.reduce((acc, x, j) => acc + x * w[j], 0); if (!(total > 0)) return [];
+    let peaks = [];
+    for (let j = 0; j < n; j++) if (e[j] > 0 && (j === 0 || e[j] >= e[j-1]) && (j === n-1 || e[j] > e[j+1])) peaks.push(j);
+    const valleyOf = (a, b) => { let v = a; for (let j = a; j <= b; j++) if (e[j] < e[v]) v = j; return v; };
+    for (let again = true; again;) {                      // merge peaks that only differ by a shallow dip
+      again = false;
+      for (let k = 0; k + 1 < peaks.length; k++) {
+        const a = peaks[k], b = peaks[k+1];
+        if (e[valleyOf(a, b)] > o.valley * Math.min(e[a], e[b])) { peaks.splice(e[a] >= e[b] ? k+1 : k, 1); again = true; break; }
+      }
+    }
+    if (!peaks.length) return [];
+    const cuts = [0]; for (let k = 0; k + 1 < peaks.length; k++) cuts.push(valleyOf(peaks[k], peaks[k+1]) + 1); cuts.push(n);
+    const parts = peaks.map((pk, k) => {
+      const lo = cuts[k], hi = cuts[k+1]; let m0 = 0; const ang = [], aw = [];
+      for (let j = lo; j < hi; j++) {
+        m0 += e[j] * w[j];
+        if (e[j] >= 0.5 * e[pk] && Number.isFinite(D[j]) && D[j] >= 0 && D[j] <= 360) { ang.push(D[j]); aw.push(e[j] * w[j]); }
+      }
+      return { Hs: 4 * Math.sqrt(m0), Tp: 1 / f[pk], Dp: ang.length ? circMean(ang, aw) : D[pk], m0, fLo: f[lo], fHi: f[hi-1] };
+    });
+    return parts.filter(p => p.Hs >= o.minHs && p.m0 >= o.minFrac * total).sort((a, b) => b.Hs - a.Hs).slice(0, o.max);
+  }
+  // Keep the source's own peak period/direction for the system that contains it.
+  function applyOfficial(parts, T, from) {
+    const f = 1 / T, p = parts.find(q => f >= q.fLo * 0.97 && f <= q.fHi * 1.03);
+    if (p && Number.isFinite(from)) { p.Tp = T; p.Dp = mod360(from); }
+    return parts;
+  }
+  function alignSpectra(ds, sw) {                       // NDBC .data_spec + .swdir -> {f, E, D}
+    if (!ds || !sw) return null; const f = [], E = [], D = [];
+    for (const p of ds.pairs) {
+      const d = sw.pairs.find(q => Math.abs(q.f - p.f) < 0.003);
+      if (p.v != null && d && d.v != null) { f.push(p.f); E.push(p.v); D.push(d.v); }
+    }
+    return f.length > 3 ? { f, E, D } : null;
+  }
+
   const haversineKm = (a, b, c, d) => {
     const p = x => x*D2R, dl = p(d-b), dp = p(c-a);
     const h = Math.sin(dp/2)**2 + Math.cos(p(a))*Math.cos(p(c))*Math.sin(dl/2)**2;
@@ -248,7 +301,7 @@ const SwellCore = (() => {
 
   return { D2R, R2D, mod360, angdiff, dot, cross, norm, rotFromEuler, rotYaw, poseFromEuler, poseFromHeadingPitch,
            headingOf, pitchOf, project, waveProps, refract, compassName, parseSpec, parseDataSpec, parseSwdir,
-           peakFromSpectra, parseNcssCsv, parseDapArray, nearestIndex, haversineKm };
+           peakFromSpectra, parseNcssCsv, parseDapArray, nearestIndex, partitionSpectrum, applyOfficial, alignSpectra, bandwidths, haversineKm };
 })();
 if (typeof module !== 'undefined') module.exports = SwellCore;
 </script>
@@ -262,7 +315,7 @@ const cv = $('cv'), ctx = cv.getContext('2d'), video = $('video');
 const M2FT = 3.28084;
 
 // ---------- settings ----------
-const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, color:'#5ac8f0', hLocal:4, hBuoy:300, scale:0.3,
+const defaults = { src:'auto', buoy:'', proxy:'', decl:0, trim:0, fov:65, camh:3, color:'#5ac8f0', multi:true, hLocal:4, hBuoy:300, scale:0.3,
                    mDir:270, mT:14, mH:1.5, seaward:null };
 let S = Object.assign({}, defaults);
 try { Object.assign(S, JSON.parse(localStorage.getItem('swellar') || '{}')); } catch (e) {}
@@ -276,12 +329,24 @@ bind('buoy','buoy',false); bind('proxy','proxy',false);
 bind('mDir','mDir'); bind('mT','mT'); bind('mH','mH');
 bind('hLocal','hLocal'); bind('hBuoy','hBuoy'); bind('decl','decl'); bind('trim','trim');
 bind('fov','fov',true,()=>$('fovv').textContent=S.fov); bind('camh','camh');
-let colRGB = '90,200,240';
-function applyColor() {                                       // pulse + compass-arrow colour from the picker
-  const h = /^#[0-9a-f]{6}$/i.test(S.color || '') ? S.color : defaults.color;
-  colRGB = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)).join(',');
-  const a = $('arrow') && $('arrow').firstElementChild; if (a) a.setAttribute('fill', h);
+let colors = [];
+function shiftHue(hex, deg) {                                    // same colour family, hue rotated, for secondary/tertiary swells
+  const [r, g, b] = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, l = (mx + mn) / 2, sat = d === 0 ? 0 : d / (1 - Math.abs(2*l - 1));
+  let h = 0; if (d) { h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h *= 60; }
+  h = (h + deg + 360) % 360;
+  const c = (1 - Math.abs(2*l - 1)) * sat, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+  const [R, G, B] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  const v = [R, G, B].map(q => Math.round((q + m) * 255));
+  return { rgb: v.join(','), hex: '#' + v.map(q => q.toString(16).padStart(2, '0')).join('') };
 }
+function applyColor() {                                          // pulse + compass-arrow colours from the picker
+  const h = /^#[0-9a-f]{6}$/i.test(S.color || '') ? S.color : defaults.color;
+  colors = [0, 140, 250].map(d => shiftHue(h, d));
+  ['arrow', 'arrow1', 'arrow2'].forEach((id, i) => { const a = $(id) && $(id).firstElementChild; if (a) a.setAttribute('fill', colors[i].hex); });
+}
+$('multi').checked = S.multi !== false;
+$('multi').addEventListener('change', () => { S.multi = $('multi').checked; save(); });
 bind('color', 'color', false, applyColor); applyColor();
 bind('scale','scale',true,()=>$('scalev').textContent=S.scale);
 $('fovv').textContent = S.fov; $('scalev').textContent = S.scale;
@@ -320,14 +385,17 @@ async function buoyReading(st) {
   if (!spec) throw new Error('no spec');
   const ageMin = (Date.now() - spec.time) / 60000;
   if (ageMin > 240) throw new Error('stale');
-  let T = spec.SwP ?? spec.APD, from = spec.SwD ?? spec.MWD, Hs = spec.SwH ?? spec.WVHT, how = '16-pt';
+  let T = spec.SwP ?? spec.APD, from = spec.SwD ?? spec.MWD, Hs = spec.SwH ?? spec.WVHT, how = '16-pt', parts = null;
   try {                                               // refine with spectra: degree-resolution direction at the energy peak
     const [ds, sw] = await Promise.all([fetchText(base + '.data_spec'), fetchText(base + '.swdir')]);
     const pk = C.peakFromSpectra(C.parseDataSpec(ds), C.parseSwdir(sw));
     if (pk) { T = pk.T; from = pk.from; how = 'spectral peak'; }
+    const al = C.alignSpectra(C.parseDataSpec(ds), C.parseSwdir(sw));
+    if (al) { const ps = C.partitionSpectrum(al.f, al.E, al.D); if (pk) C.applyOfficial(ps, pk.T, pk.from);
+      if (ps.length) parts = ps.map(p => ({ from: p.Dp, T: p.Tp, Hs: p.Hs })); }
   } catch (e) {}
   if (from == null || T == null || Hs == null) throw new Error('incomplete');
-  return { from, T, Hs, src: 'NDBC ' + st.id, how, distKm: st.km, ageMin };
+  return { from, T, Hs, parts, src: 'NDBC ' + st.id, how, distKm: st.km, ageMin };
 }
 // CDIP MOP: CDIP's buoy-driven nearshore wave model. One point every ~100 m along the coast in ~10 m of water, hourly
 // nowcast, and the shore-normal direction for each point. THREDDS allows browser requests, so no proxy is needed.
@@ -350,8 +418,9 @@ async function mopReading(lat, lon) {
     try {
       const tb = await mopTable(set), { i, km } = C.nearestIndex(tb.lat, tb.lon, lat, lon);
       if (i < 0 || km > 5) continue;
-      const sel = `[0:11][${i}:${i}]`;
-      const r = await fetch(`${MOP_BASE}${set}_alongshore_nowcast.nc.ascii?waveTime,waveFlagPrimary${sel},waveHs${sel},waveTp${sel},waveDp${sel}`);
+      const sel = `[0:11][${i}:${i}]`, sel3 = `[0:11][0:19][${i}:${i}]`;
+      const r = await fetch(`${MOP_BASE}${set}_alongshore_nowcast.nc.ascii?waveTime,waveFlagPrimary${sel},waveHs${sel},waveTp${sel},waveDp${sel},` +
+                            `waveFrequency,waveBandwidth,waveEnergyDensity${sel3},waveMeanDirection${sel3}`);
       if (!r.ok) throw new Error('MOP data ' + r.status);
       const x = await r.text();
       const tm = C.parseDapArray(x, 'waveTime'), fl = C.parseDapArray(x, 'waveFlagPrimary'), Hs = C.parseDapArray(x, 'waveHs'),
@@ -360,7 +429,15 @@ async function mopReading(lat, lon) {
         if (fl[k] === 1 && Hs[k] >= 0 && Tp[k] > 0 && Dp[k] >= 0 && Dp[k] <= 360) {
           const ageMin = (Date.now() - tm[k] * 1000) / 60000;
           if (ageMin > 360) throw new Error('model data stale');
-          return { from: Dp[k], T: Tp[k], Hs: Hs[k], src: 'CDIP nearshore model', how: 'buoy-driven, ' + Math.round(tb.dep[i]) + ' m depth',
+          let parts = null;                                          // split the spectrum into separate swell systems
+          try {
+            const f = C.parseDapArray(x, 'waveFrequency'), bw = C.parseDapArray(x, 'waveBandwidth'), n = f.length;
+            const E = C.parseDapArray(x, 'waveEnergyDensity').slice(k * n, (k + 1) * n), D = C.parseDapArray(x, 'waveMeanDirection').slice(k * n, (k + 1) * n);
+            const ps = C.applyOfficial(C.partitionSpectrum(f, E, D, bw), Tp[k], Dp[k]);
+            if (ps.length) parts = ps.map(p => ({ from: p.Dp, T: p.Tp, Hs: p.Hs }));
+          } catch (e) {}
+          const top = parts ? parts[0] : { from: Dp[k], T: Tp[k], Hs: Hs[k] };
+          return { from: top.from, T: top.T, Hs: top.Hs, parts, src: 'CDIP nearshore model', how: 'buoy-driven, ' + Math.round(tb.dep[i]) + ' m depth',
                    distKm: km, ageMin, depth: tb.dep[i], seaward: tb.sn[i] };
         }
       }
@@ -371,11 +448,14 @@ async function mopReading(lat, lon) {
 }
 async function modelReading() {
   if (!here) throw new Error('no position');
-  const url = `https://marine-api.open-meteo.com/v1/marine?latitude=${here.lat.toFixed(3)}&longitude=${here.lon.toFixed(3)}` +
-              `&current=swell_wave_height,swell_wave_period,swell_wave_direction`;
-  const j = await (await fetch(url)).json();
-  const c = j.current; if (!c || c.swell_wave_direction == null) throw new Error('no model data');
-  return { from: c.swell_wave_direction, T: c.swell_wave_period, Hs: c.swell_wave_height, src: 'Open-Meteo model', how: 'model', distKm: 0, ageMin: 0 };
+  const v = ['swell', 'secondary_swell', 'tertiary_swell'].flatMap(n => [n + '_wave_height', n + '_wave_period', n + '_wave_direction']).join(',');
+  const j = await (await fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${here.lat.toFixed(3)}&longitude=${here.lon.toFixed(3)}&current=${v}`)).json();
+  const c = j.current; if (!c) throw new Error('no model data');
+  const parts = ['swell', 'secondary_swell', 'tertiary_swell']
+    .map(n => ({ Hs: c[n + '_wave_height'], T: c[n + '_wave_period'], from: c[n + '_wave_direction'] }))
+    .filter(p => p.Hs >= 0.1 && p.T > 0 && p.from != null).sort((a, b) => b.Hs - a.Hs);
+  if (!parts.length) throw new Error('no model data');
+  return { from: parts[0].from, T: parts[0].T, Hs: parts[0].Hs, parts, src: 'Open-Meteo model', how: 'global model', distKm: 0, ageMin: 0 };
 }
 let loading = false;
 async function loadSwell() {
@@ -472,11 +552,10 @@ $('calib').onclick = () => {
 function resize() { const d = Math.min(devicePixelRatio || 1, 2); cv.width = innerWidth * d; cv.height = innerHeight * d; }
 addEventListener('resize', resize); resize();
 
-function nearshore() {
-  if (!swell) return null;
-  const T = Math.max(swell.T, 3);
+function nearshore(p) {
+  const T = Math.max(p.T, 3);
   const sea = S.seaward ?? swell.seaward ?? null;                 // your own "set sea direction" wins over the model's shore normal
-  const from = C.refract(swell.from, sea, T, S.hLocal, swell.depth ?? S.hBuoy);
+  const from = C.refract(p.from, sea, T, S.hLocal, swell.depth ?? S.hBuoy);
   return { from, T, sea, wp: C.waveProps(T, S.hLocal) };
 }
 function backdrop(W, H, pitch) {
@@ -484,31 +563,12 @@ function backdrop(W, H, pitch) {
   const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#6aa9c9'); g.addColorStop(Math.min(Math.max(hy/H,0.01),0.99), '#cfe6f1'); g.addColorStop(Math.min(Math.max(hy/H,0.01),0.99)+0.001, '#14607a'); g.addColorStop(1, '#06263a');
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
 }
-function frame(now) {
-  requestAnimationFrame(frame);
-  const W = cv.width, H = cv.height, t = now / 1000;
-  ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, W, H);
-  let ps = pose;
-  if (demoMode) ps = C.poseFromHeadingPitch(demoHeading, -8);
-  if (demoMode) backdrop(W, H, -8);
-  const ns = nearshore(); const heading = ps ? C.headingOf(ps.f) : null;
-  const ft = x => (x * M2FT).toFixed(1);
-  if (swell && ns) {
-    $('line1').innerHTML = `<b>${ft(swell.Hs)} ft @ ${swell.T.toFixed(0)} s</b> from <b>${Math.round(swell.from)}° ${C.compassName(swell.from)}</b>` +
-      (ns.sea != null ? ` → <b>${Math.round(ns.from)}°</b> at the beach` : '');
-    $('line2').textContent = `${swell.src}` + (swell.distKm ? ` · ${Math.round(swell.distKm)} km` : '') + (swell.ageMin ? ` · ${Math.round(swell.ageMin)} min old` : '') + ` · ${swell.how}` +
-      (heading != null ? ` · facing ${Math.round(heading)}°` : '');
-  } else $('line1').innerHTML = '<b>SwellAR</b>';
-  if (!ps || !swell || !ns) return;
-
-  // compass arrow: direction of travel relative to where the camera points (up = away from you)
-  const travel = ns.from + 180;
-  $('arrow').setAttribute('transform', `rotate(${C.angdiff(travel, heading)})`);
-
-  const fpx = (W/2) / Math.tan(S.fov * C.D2R / 2), camH = S.camh, Smax = 450;
+// One swell system = one train of crest ribbons travelling in its own (refracted) direction.
+function drawTrain(ps, ns, Hs, ampScale, rgb, t, W, H, fpx) {
+  const camH = S.camh, Smax = 450, travel = ns.from + 180;
   const th = travel * C.D2R, p = [Math.sin(th), Math.cos(th)], q = [Math.cos(th), -Math.sin(th)];
   const k = S.scale, Ls = ns.wp.L * k, vs = ns.wp.c * k, vg = ns.wp.cg * k, Lg = Ls * 7;
-  const amp = Math.min(1, 0.45 + swell.Hs / 3);
+  const amp = Math.min(1, 0.45 + Hs / 3) * ampScale;
   const phase = ((vs * t) % Ls + Ls) % Ls;
   ctx.globalCompositeOperation = 'source-over'; ctx.lineCap = 'butt';   // normal blending so dark colours stay visible
   for (let s = phase - Math.ceil(Smax / Ls) * Ls; s <= Smax; s += Ls) {
@@ -517,7 +577,7 @@ function frame(now) {
     if (a < 0.03) continue;
     // Each crest is drawn as one filled ribbon (no per-segment overlaps, so any colour blends cleanly).
     const cf = Math.max(0.12, 1 - Math.pow(Math.abs(s) / Smax, 1.2));          // fade by the crest's distance from you
-    ctx.fillStyle = `rgba(${colRGB},${(0.85 * a * cf).toFixed(3)})`;
+    ctx.fillStyle = `rgba(${rgb},${(0.85 * a * cf).toFixed(3)})`;
     let run = [];
     const flush = () => {
       if (run.length > 1) {
@@ -543,6 +603,36 @@ function frame(now) {
     }
     flush();
   }
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  const W = cv.width, H = cv.height, t = now / 1000;
+  ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, W, H);
+  let ps = pose;
+  if (demoMode) ps = C.poseFromHeadingPitch(demoHeading, -8);
+  if (demoMode) backdrop(W, H, -8);
+  const heading = ps ? C.headingOf(ps.f) : null;
+  const ft = x => (x * M2FT).toFixed(1);
+  const all = !swell ? [] : (S.multi === false ? [swell] : (swell.parts && swell.parts.length ? swell.parts : [swell]));
+  const parts = all.slice(0, 3), nss = parts.map(nearshore);
+  const row = (p, ns, i) => `<span style="color:${colors[i].hex}">●</span> <b>${ft(p.Hs)} ft @ ${p.T.toFixed(0)} s</b> from <b>${Math.round(p.from)}° ${C.compassName(p.from)}</b>` +
+    (ns.sea != null ? ` → <b>${Math.round(ns.from)}°</b> at the beach` : '');
+  if (parts.length) {
+    $('line1').innerHTML = row(parts[0], nss[0], 0);
+    $('more').innerHTML = parts.slice(1).map((p, i) => row(p, nss[i + 1], i + 1)).join('<br>');
+    $('line2').textContent = `${swell.src}` + (swell.distKm ? ` · ${Math.round(swell.distKm)} km` : '') + (swell.ageMin ? ` · ${Math.round(swell.ageMin)} min old` : '') + ` · ${swell.how}` +
+      (heading != null ? ` · facing ${Math.round(heading)}°` : '');
+  } else { $('line1').innerHTML = '<b>SwellAR</b>'; $('more').innerHTML = ''; }
+  if (!ps || !parts.length) return;
+
+  // compass arrows: direction of travel relative to where the camera points (up = away from you), one per swell
+  ['arrow', 'arrow1', 'arrow2'].forEach((id, i) => {
+    const el = $(id); el.style.display = i < parts.length ? '' : 'none';
+    if (i < parts.length) el.setAttribute('transform', `rotate(${C.angdiff(nss[i].from + 180, heading)})`);
+  });
+  const fpx = (W/2) / Math.tan(S.fov * C.D2R / 2), hsMax = Math.max(...parts.map(p => p.Hs), 0.01);
+  for (let i = parts.length - 1; i >= 0; i--)                     // draw the smaller swells first so the main one sits on top
+    drawTrain(ps, nss[i], parts[i].Hs, Math.max(0.45, Math.sqrt(parts[i].Hs / hsMax)), colors[i].rgb, t, W, H, fpx);
 }
 requestAnimationFrame(frame);
 window.__swellar = { async probe(lat, lon) { here = { lat, lon }; await loadSwell(); return { swell, status: $('status').textContent }; },

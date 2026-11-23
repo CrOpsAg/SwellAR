@@ -82,4 +82,26 @@ const tbl = `Dataset {\n    Float32 metaLatitude[siteCount = 3];\n} x;\n---\nmet
 const la = C.parseDapArray(tbl, 'metaLatitude'), lo = C.parseDapArray(tbl, 'metaLongitude');
 const ni = C.nearestIndex(la, lo, 34.27, -119.30); assert.strictEqual(ni.i, 1); assert(ni.km < 1, 'nearest point < 1 km');
 assert(C.nearestIndex(la, lo, 40, -100).km > 100, 'far away is far');
+// 9. spectral partitioning
+// (a) real CDIP MOP spectrum captured at Ventura: one broad swell, so it must NOT be split into noise peaks; Hs must match the model's 0.744 m
+const rf=[0.04,0.045,0.05,0.055,0.06,0.065,0.07,0.075,0.0813,0.09,0.1,0.11,0.1225,0.14,0.16,0.18,0.2075,0.25,0.3125,0.4];
+const rE=[0.0024,0.0076,0.0296,0.1344,0.3838,0.3746,0.3444,0.3886,0.2821,0.3046,0.2894,0.292,0.1631,0.1245,0.1112,0.0887,0.0617,0.0512,0.0193,0.0037];
+const rD=[218,219,218,211,210,216,217,218,221,226,230,233,236,239,243,247,254,259,257,247];
+const rbw=[0.005,0.005,0.005,0.005,0.005,0.005,0.005,0.00565,0.00815,0.009,0.01,0.01,0.015,0.0175,0.02,0.0275,0.0425,0.0625,0.0625,0.0875];
+let pr = C.partitionSpectrum(rf, rE, rD, rbw);
+assert.strictEqual(pr.length, 1, 'broad spectrum stays one system'); close(pr[0].Hs, 0.744, 0.02, 'real-spectrum Hs');
+pr = C.applyOfficial(pr, 11.1, 229.8); close(pr[0].Tp, 11.1, 1e-9, 'official Tp kept'); close(pr[0].Dp, 229.8, 1e-9, 'official Dp kept');
+// (b) synthetic: strong 16 s from 200 deg and weaker 8 s from 270 deg with a deep valley -> two systems, ordered by height, right directions
+const sf=[0.05,0.0625,0.075,0.0875,0.1,0.1125,0.125,0.1375,0.15], sE=[0.2,1.0,0.3,0.05,0.04,0.3,0.6,0.2,0.05], sD=[200,200,205,230,260,270,270,272,275];
+const sp2 = C.partitionSpectrum(sf, sE, sD);
+assert.strictEqual(sp2.length, 2, 'two systems'); assert(sp2[0].Hs > sp2[1].Hs, 'sorted by height');
+close(sp2[0].Tp, 16, 1e-9, 'primary Tp'); close(sp2[0].Dp, 200, 6, 'primary dir'); close(sp2[1].Tp, 8, 1e-9, 'secondary Tp'); close(sp2[1].Dp, 270, 4, 'secondary dir');
+// energy conservation: partition m0 adds up to total spectrum m0 when nothing is filtered
+const all = C.partitionSpectrum(sf, sE, sD, undefined, { minHs: 0, minFrac: 0 }), bws = C.bandwidths(sf);
+close(all.reduce((a, p) => a + p.m0, 0), sE.reduce((a, e, j) => a + e * bws[j], 0), 1e-9, 'partitions conserve energy');
+// (c) tiny partitions are dropped, max 3 returned
+assert(C.partitionSpectrum(sf, [0,0,0,0,0,0,0,0,0], sD).length === 0, 'empty spectrum -> none');
+// (d) NDBC alignment
+const al = C.alignSpectra({ pairs: [{v:0.1,f:0.05},{v:0.5,f:0.06},{v:0.2,f:0.07},{v:0.1,f:0.08}] }, { pairs: [{v:200,f:0.05},{v:201,f:0.06},{v:202,f:0.07},{v:203,f:0.08}] });
+assert.deepStrictEqual(al.D, [200,201,202,203]);
 console.log('all tests passed');
